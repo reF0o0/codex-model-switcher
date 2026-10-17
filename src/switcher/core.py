@@ -66,12 +66,52 @@ def provider_auth_config(text):
     return ''.join(lines[:alias])+table+''.join(lines[alias_end:])
 
 
+def _process_lines():
+    """Read the process list without ever raising: an unreadable list must not break the tool."""
+    for command in (['/bin/ps','-axo','comm='],['/usr/bin/lsappinfo','list']):
+        try:return subprocess.run(command,capture_output=True,text=True,check=True).stdout.splitlines()
+        except (OSError,subprocess.SubprocessError):continue
+    return None
+
+
+def desktop_state():
+    """'running' / 'stopped' / 'unknown'. Never guesses and never raises."""
+    lines=_process_lines()
+    if lines is None:return 'unknown'
+    for raw in lines:
+        path=raw.strip()
+        if path.endswith(('/ChatGPT.app/Contents/MacOS/ChatGPT','/Codex.app/Contents/MacOS/Codex')):return 'running'
+        if Path(path).name in ['codex','codex-app-server']:return 'running'
+        if 'bundleID=[com.openai.codex]' in path or 'bundleID=[com.openai.chat]' in path:return 'running'
+    return 'stopped'
+
+
 def desktop_running():
-    result=subprocess.run(['/bin/ps','-axo','comm='],capture_output=True,text=True,check=True)
-    return any(p.strip().endswith(('/ChatGPT.app/Contents/MacOS/ChatGPT',
-                                  '/Codex.app/Contents/MacOS/Codex')) or
-               Path(p.strip()).name in ['codex','codex-app-server']
-               for p in result.stdout.splitlines())
+    return desktop_state()=='running'
+
+
+KEY_PATTERN=re.compile(r'^[A-Za-z0-9][A-Za-z0-9._\-]{5,255}$')
+INVISIBLE='\u200b\u200c\u200d\u2060\ufeff\u00a0'
+
+
+def normalize_key(raw):
+    """Accept what people actually paste, and say exactly what is wrong when we cannot."""
+    if not isinstance(raw,str):raise ValueError('API key 格式无效：没有收到密钥内容，请重新粘贴')
+    text=raw.strip()
+    if text[:7].lower()=='bearer ':text=text[7:].strip()
+    if len(text)>1 and text[0]==text[-1] and text[0] in '"\'':text=text[1:-1].strip()
+    if not text:raise ValueError('API key 格式无效：输入框是空的，请粘贴 DeepSeek 控制台里的密钥（通常以 sk- 开头）')
+    key=''.join(c for c in text if not (c.isspace() or c in INVISIBLE))
+    removed=len(text)-len(key)
+    if not key:raise ValueError('API key 格式无效：只收到空白字符，请重新复制密钥')
+    if len(key)>256:raise ValueError('API key 格式无效：收到 '+str(len(key))+' 个字符，远超正常密钥长度，请只粘贴 sk- 开头的那一段')
+    if not KEY_PATTERN.match(key):
+        bad=sorted({c for c in key if not re.match(r'[A-Za-z0-9._\-]',c)})
+        sample='、'.join('U+%04X %s'%(ord(c),c) for c in bad[:4])
+        raise ValueError('API key 格式无效：密钥中含有不允许的字符（'+sample+'）；请从 DeepSeek 控制台重新复制，不要带上中文标点或引号')
+    note='已自动移除粘贴带进来的 '+str(removed)+' 个空白或不可见字符' if removed else ''
+    if not key.startswith('sk-'):note=(note+'；' if note else '')+'提醒：该密钥不以 sk- 开头，如调用失败请重新复制'
+    return key,note
 
 
 def header_for_provider(line, provider):
@@ -135,8 +175,12 @@ class Switcher:
         with path.open('a') as f:
             try:fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)
             except BlockingIOError:raise ValueError('另一个切换或备份操作正在进行')
-            if closed and self.require_closed and desktop_running():
-                raise ValueError('请先在 ChatGPT/Codex 中按 ⌘Q 完全退出，并关闭仍在运行的 Codex 终端或后台任务，再回本工具刷新。当前聊天也会暂停；重新打开后可以继续。')
+            if closed and self.require_closed:
+                state=desktop_state()
+                if state=='running':
+                    raise ValueError('请先在 ChatGPT/Codex 中按 ⌘Q 完全退出，并关闭仍在运行的 Codex 终端或后台任务，再回本工具刷新。当前聊天也会暂停；重新打开后可以继续。')
+                if state=='unknown':
+                    raise ValueError('无法确认 ChatGPT 是否已退出（系统拒绝了进程查询），为避免覆盖配置已停止操作。请先按 ⌘Q 退出 ChatGPT，再重试。')
             if self.pending.exists() and not allow_pending:
                 raise ValueError('上次切换未完成，请先在“备份与恢复”中恢复备份 '+json.loads(self.pending.read_text())['backup_id'])
             yield
@@ -298,9 +342,8 @@ class Switcher:
             return {'restored':ident,'backup_id':safety['id'],'removed':len(removed),
                     'message':'已恢复模型和服务商设置；恢复点之后的新会话、新消息均保留。'}
 
-    def save_key(self,key):
-        key=key.strip()
-        if not key or len(key)>1000 or any(c.isspace() for c in key):raise ValueError('API key 格式无效')
+    def save_key(self,raw):
+        key,note=normalize_key(raw)
         with self.lock():
             text=self.config.read_text()
             lines=text.splitlines(keepends=True)
@@ -316,7 +359,9 @@ class Switcher:
             snapshot=self.snapshot()
             atomic_write(self.config,text.encode())
             if self.settings()['auto_cleanup']:self._cleanup()
-            return {'backup_id':snapshot['id'],'message':'DeepSeek 密钥已保存到本机配置；ChatGPT 登录未更改。'}
+            message='DeepSeek 密钥已保存到本机配置；ChatGPT 登录未更改。'
+            if note:message+='（'+note+'）'
+            return {'backup_id':snapshot['id'],'key_configured':True,'message':message}
 
     def transcript(self,tid):
         database=self.home/'thread_history_1.sqlite'
@@ -399,10 +444,14 @@ class Switcher:
         logical='deepseek' if config.get('model_provider') in ['deepseek','ds_api'] else 'openai'
         for thread in threads:thread['continuation_id']=links.get(thread['id'],{}).get(logical)
         provider=config.get('model_provider','openai')
+        state=desktop_state()
+        deepseek_config=config.get('model_providers',{}).get('deepseek',{})
+        key_configured=bool(deepseek_config.get('experimental_bearer_token') or
+                            (deepseek_config.get('env_key') and os.environ.get(deepseek_config['env_key'])))
         return {'provider':'deepseek' if provider=='ds_api' else provider,'model':config.get('model','默认'),
                 'effort':config.get('model_reasoning_effort','默认'),'threads':threads,
                 'backups':[{'id':s['id'],'created_at':s['created_at'],'files':len(s['files'])} for s in snapshots],
-                'settings':self.settings(),'desktop_running':desktop_running(),
+                'settings':self.settings(),'desktop_running':state=='running','desktop_check':state,
                 'pending':json.loads(self.pending.read_text()) if self.pending.exists() else None,
                 'backup_path':str(self.store.root),
-                'key_configured':bool(config.get('model_providers',{}).get('deepseek',{}).get('experimental_bearer_token'))}
+                'key_configured':key_configured}

@@ -20,7 +20,7 @@ def db_connection(path):
     finally:con.close()
 
 
-class SwitchTests(unittest.TestCase):
+class CodexHomeFixture(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = pathlib.Path(self.tmp.name)
@@ -44,6 +44,8 @@ class SwitchTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+
+class SwitchTests(CodexHomeFixture):
     def rows(self):
         with db_connection(self.home/'state_5.sqlite') as db:
             return db.execute('select id,model_provider,model,archived,title from threads order by id').fetchall()
@@ -191,6 +193,82 @@ class SwitchTests(unittest.TestCase):
             return actual(fd)
         with patch('os.fsync',side_effect=sync):atomic_write(self.root/'durable.txt',b'kept')
         self.assertTrue(any(seen),'directory publication must be synced before returning')
+
+
+class KeyInputTests(CodexHomeFixture):
+    """Accepted input must cover what people really paste, and errors must say why."""
+
+    def saved_key(self):
+        import tomllib
+        config=tomllib.loads((self.home/'config.toml').read_text())
+        return config['model_providers']['deepseek']['experimental_bearer_token']
+
+    def test_pasted_key_with_padding_and_newline_is_cleaned(self):
+        result=self.app.save_key('  sk-test-0123456789abcdef \n')
+        self.assertEqual(self.saved_key(),'sk-test-0123456789abcdef')
+        self.assertIn('已保存',result['message'])
+
+    def test_inner_space_bearer_prefix_and_quotes_are_cleaned_not_rejected(self):
+        result=self.app.save_key('Bearer "sk-01 23 45 67"')
+        self.assertEqual(self.saved_key(),'sk-01234567')
+        self.assertIn('已自动移除',result['message'])
+
+    def test_empty_input_explains_itself(self):
+        with self.assertRaises(ValueError) as caught:self.app.save_key('  \n ')
+        self.assertIn('空的',str(caught.exception))
+
+    def test_non_ascii_key_is_reported_with_the_offending_codes(self):
+        with self.assertRaises(ValueError) as caught:self.app.save_key('sk-密钥')
+        message=str(caught.exception)
+        self.assertIn('不允许的字符',message)
+        self.assertIn('U+5BC6',message)
+
+    def test_overlong_input_is_reported(self):
+        with self.assertRaises(ValueError) as caught:self.app.save_key('sk-'+'a'*400)
+        self.assertIn('远超正常密钥长度',str(caught.exception))
+
+    def test_non_string_payload_is_rejected(self):
+        with self.assertRaises(ValueError):self.app.save_key(None)
+
+    def test_non_sk_prefix_is_saved_with_a_reminder(self):
+        result=self.app.save_key('my-relay-key-123456')
+        self.assertEqual(self.saved_key(),'my-relay-key-123456')
+        self.assertIn('不以 sk- 开头',result['message'])
+
+
+class ProcessProbeTests(CodexHomeFixture):
+    """An unreadable process list must never turn the whole tool into one opaque error."""
+
+    def test_status_reports_unknown_instead_of_failing(self):
+        from unittest.mock import patch
+        with patch('switcher.core._process_lines',return_value=None):
+            status=self.app.status()
+        self.assertEqual(status['desktop_check'],'unknown')
+        self.assertFalse(status['desktop_running'])
+
+    def test_status_reports_stopped_when_list_is_readable(self):
+        from unittest.mock import patch
+        with patch('switcher.core._process_lines',return_value=['/usr/sbin/cfprefsd','/bin/zsh']):
+            self.assertEqual(self.app.status()['desktop_check'],'stopped')
+
+    def test_running_chatgpt_is_detected(self):
+        from unittest.mock import patch
+        with patch('switcher.core._process_lines',return_value=['/Applications/ChatGPT.app/Contents/MacOS/ChatGPT']):
+            self.assertEqual(self.app.status()['desktop_check'],'running')
+
+    def test_key_save_is_blocked_with_a_clear_message_when_the_probe_is_unavailable(self):
+        from unittest.mock import patch
+        closed=Switcher(self.home, require_closed=True)
+        with patch('switcher.core._process_lines',return_value=None):
+            with self.assertRaises(ValueError) as caught:closed.save_key('sk-test-0123456789')
+        self.assertIn('无法确认',str(caught.exception))
+
+    def test_key_save_is_blocked_while_chatgpt_is_running(self):
+        from unittest.mock import patch
+        closed=Switcher(self.home, require_closed=True)
+        with patch('switcher.core._process_lines',return_value=['/Applications/ChatGPT.app/Contents/MacOS/ChatGPT']):
+            with self.assertRaises(ValueError) as caught:closed.save_key('sk-test-0123456789')
+        self.assertIn('⌘Q',str(caught.exception))
 
 
 class PruneTests(unittest.TestCase):

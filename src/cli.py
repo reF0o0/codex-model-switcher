@@ -4,24 +4,42 @@ import sys
 sys.dont_write_bytecode = True
 from switcher.core import Switcher
 
+PAYLOAD_COMMANDS=['switch','restore','settings','save-key','bridge']
+
+
+def payload():
+    if sys.stdin.isatty():raise ValueError('没有收到参数：请在本工具界面里操作，不要直接双击打开后端脚本')
+    raw=sys.stdin.read()
+    if not raw.strip():raise ValueError('没有收到参数：请重新点一次按钮；没有修改任何文件')
+    try:data=json.loads(raw)
+    except ValueError:raise ValueError('请求参数无法解析，请重新点一次按钮；没有修改任何文件')
+    if not isinstance(data,dict):raise ValueError('请求参数无法解析，请重新点一次按钮；没有修改任何文件')
+    return data
+
+
+def require(data,name,what):
+    value=data.get(name)
+    if not isinstance(value,str) or not value:raise ValueError('没有收到'+what+'，请重新操作；没有修改任何文件')
+    return value
+
 
 def main():
     p=argparse.ArgumentParser()
     p.add_argument('--home')
     p.add_argument('command',choices=['status','startup','switch','backup','restore','cleanup','settings','save-key','bridge'])
     args=p.parse_args()
-    data=json.load(sys.stdin) if not sys.stdin.isatty() and args.command in ['switch','restore','settings','save-key','bridge'] else {}
+    data=payload() if args.command in PAYLOAD_COMMANDS else {}
     app=Switcher(args.home)
     if args.command in ['status','startup']:
         if args.command=='startup' and app.settings()['auto_cleanup']:app.cleanup()
         result=app.status()
-    elif args.command=='switch':result=app.switch(data['provider'],data['model'],data.get('effort','high'))
+    elif args.command=='switch':result=app.switch(require(data,'provider','服务商'),require(data,'model','模型'),data.get('effort','high'))
     elif args.command=='backup':result=app.backup()
-    elif args.command=='restore':result=app.restore(data['id'])
+    elif args.command=='restore':result=app.restore(require(data,'id','备份 ID'))
     elif args.command=='cleanup':result={'removed':len(app.cleanup())}
-    elif args.command=='settings':result=app.save_settings(int(data['keep']),int(data['days']),data.get('auto_cleanup',True))
-    elif args.command=='bridge':result=app.bridge(data['id'])
-    else:result=app.save_key(data['key'])
+    elif args.command=='settings':result=app.save_settings(int(data.get('keep',0)),int(data.get('days',0)),data.get('auto_cleanup',True))
+    elif args.command=='bridge':result=app.bridge(require(data,'id','会话 ID'))
+    else:result=app.save_key(data.get('key',''))
     print(json.dumps({'ok':True,'result':result},ensure_ascii=False))
 
 
@@ -29,6 +47,11 @@ if __name__=='__main__':
     try:main()
     except Exception as exc:
         # Known validation messages are safe; never print arbitrary config parser contents or secrets.
-        message=str(exc) if isinstance(exc,ValueError) and not isinstance(exc,json.JSONDecodeError) else '操作失败（'+type(exc).__name__+'），原会话保留。请检查磁盘空间和文件权限。'
-        if 'TOML' in type(exc).__name__:message='配置文件格式无效，已停止操作。'
+        name=type(exc).__name__
+        if 'TOML' in name:
+            detail=' '.join(str(exc).split())[:160]
+            message='配置文件格式无效，已停止操作。'+(('（'+detail+'）') if detail else '')
+        elif isinstance(exc,ValueError) and not isinstance(exc,json.JSONDecodeError):message=str(exc)
+        elif isinstance(exc,OSError):message='读写 Codex 配置或备份目录时被系统拒绝（'+name+'），已停止操作，原会话未改动。请检查 ~/.codex 的权限后重试。'
+        else:message='操作失败（'+name+'），原会话保留。请检查磁盘空间和文件权限。'
         print(json.dumps({'ok':False,'error':message},ensure_ascii=False));sys.exit(1)

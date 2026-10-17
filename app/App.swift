@@ -27,6 +27,7 @@ struct Snapshot: Decodable {
     let backups: [BackupRow]
     let settings: Preferences
     let desktop_running: Bool
+    let desktop_check: String
     let pending: [String:String]?
     let backup_path: String
     let key_configured: Bool
@@ -153,6 +154,9 @@ struct ContentView: View {
                 if status.desktop_running {
                     Label("ChatGPT 正在运行。切换、备份或恢复前，请在 ChatGPT 按 ⌘Q 退出。",systemImage:"info.circle")
                         .font(.callout).foregroundStyle(.secondary)
+                } else if status.desktop_check == "unknown" {
+                    Label("无法确认 ChatGPT 是否在运行（系统限制了进程查询）。切换前请自行确认已按 ⌘Q 退出。",systemImage:"exclamationmark.triangle")
+                        .font(.callout).foregroundStyle(.orange)
                 }
             }
             TabView(selection:$app.tab) {
@@ -210,10 +214,26 @@ struct ContentView: View {
                 .disabled(app.busy || app.snapshot?.desktop_running == true || app.snapshot?.pending != nil)
             Divider()
             DisclosureGroup("DeepSeek 密钥设置（仅需首次或更换密钥）") {
-                HStack {
-                    SecureField(app.snapshot?.key_configured == true ? "已配置；输入新密钥以替换" : "输入 DeepSeek API key",text:$app.key)
-                    Button("保存密钥") {app.run("save-key",["key":app.key]);app.key=""}
-                        .disabled(app.key.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty || app.busy || app.snapshot?.desktop_running == true)
+                VStack(alignment:.leading,spacing:8) {
+                    HStack {
+                        SecureField(app.snapshot?.key_configured == true ? "已保存密钥；要更换再粘贴新的" : "粘贴 DeepSeek 密钥（通常以 sk- 开头）",text:$app.key)
+                        Button("保存密钥") {app.run("save-key",["key":app.key]);app.key=""}
+                            .disabled(app.key.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty || app.busy || app.snapshot?.desktop_running == true)
+                    }
+                    if app.snapshot?.key_configured == true {
+                        Label("本机已保存 DeepSeek 密钥，可以直接切换；只有换密钥时才需要重新填写。",systemImage:"checkmark.seal")
+                            .font(.caption).foregroundStyle(.green)
+                    }
+                    if app.snapshot?.desktop_running == true {
+                        Label("保存密钥同样要先按 ⌘Q 退出 ChatGPT：否则它退出时会用旧配置覆盖这次写入，这也是「保存密钥」变灰的原因。",systemImage:"lock")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    if app.snapshot?.desktop_check == "unknown" {
+                        Label("无法确认 ChatGPT 是否在运行（系统拒绝了进程查询）。请先确认已完全退出，再保存。",systemImage:"exclamationmark.triangle")
+                            .font(.caption).foregroundStyle(.orange)
+                    }
+                    Text("密钥只写进本机 ~/.codex/config.toml，不上传；粘贴时带进来的空格、换行或 Bearer 前缀会自动清理。")
+                        .font(.caption).foregroundStyle(.secondary)
                 }.padding(.top,8)
             }
             Text("消息正文保持原样；只同步文件头的服务商，并保持字节长度不变。若旧消息格式不兼容，保留原会话后可用新会话接续。")
