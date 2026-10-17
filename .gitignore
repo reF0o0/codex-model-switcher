@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+dist/
+build/
+.venv/
+auth.json
+config.toml
+models.json
+*.sqlite*
+*.jsonl
+provider-switcher/
