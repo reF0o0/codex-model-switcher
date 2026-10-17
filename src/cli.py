@@ -26,7 +26,7 @@ def require(data,name,what):
 def main():
     p=argparse.ArgumentParser()
     p.add_argument('--home')
-    p.add_argument('command',choices=['status','startup','switch','backup','restore','cleanup','settings','save-key','bridge'])
+    p.add_argument('command',choices=['status','startup','switch','backup','restore','cleanup','settings','save-key','bridge','repair'])
     args=p.parse_args()
     data=payload() if args.command in PAYLOAD_COMMANDS else {}
     app=Switcher(args.home)
@@ -36,6 +36,7 @@ def main():
     elif args.command=='switch':result=app.switch(require(data,'provider','服务商'),require(data,'model','模型'),data.get('effort','high'))
     elif args.command=='backup':result=app.backup()
     elif args.command=='restore':result=app.restore(require(data,'id','备份 ID'))
+    elif args.command=='repair':result=app.repair()
     elif args.command=='cleanup':result={'removed':len(app.cleanup())}
     elif args.command=='settings':result=app.save_settings(int(data.get('keep',0)),int(data.get('days',0)),data.get('auto_cleanup',True))
     elif args.command=='bridge':result=app.bridge(require(data,'id','会话 ID'))

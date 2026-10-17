@@ -31,6 +31,7 @@ struct Snapshot: Decodable {
     let pending: [String:String]?
     let backup_path: String
     let key_configured: Bool
+    let key_storage: String?
 }
 
 final class AppModel: ObservableObject {
@@ -50,6 +51,7 @@ final class AppModel: ObservableObject {
     @Published var restoreID: String? = nil
     @Published var confirmSwitch = false
     @Published var confirmRestore = false
+    @Published var confirmRepair = false
     @Published var key = ""
     var loaded = false
     let choices = ["openai":["gpt-6.1-sol","gpt-6-sol","gpt-6-luna","gpt-6-astra"],
@@ -187,6 +189,10 @@ struct ContentView: View {
             Button("创建安全备份并恢复") {if let id=app.restoreID {app.run("restore",["id":id])}}
             Button("取消",role:.cancel) {}
         } message: {Text("恢复点之后的新会话和新消息仍会保留。此功能不会用旧数据库覆盖当前历史。")}
+        .confirmationDialog("只修复当前模型的路由？",isPresented:$app.confirmRepair,titleVisibility:.visible) {
+            Button("备份并修复") {app.run("repair")}
+            Button("取消",role:.cancel) {}
+        } message: {Text("保持当前模型和服务商不变，只把 GPT／DeepSeek 会话的文件头与数据库路由重新对齐。")}
     }
 
     var switchView: some View {
@@ -212,6 +218,12 @@ struct ContentView: View {
             Button("备份并切换全部会话",systemImage:"arrow.triangle.swap") {app.confirmSwitch=true}
                 .buttonStyle(.borderedProminent).controlSize(.large)
                 .disabled(app.busy || app.snapshot?.desktop_running == true || app.snapshot?.pending != nil)
+            HStack {
+                Button("只修复路由，不切换模型",systemImage:"wrench.and.screwdriver") {app.confirmRepair=true}
+                    .disabled(app.busy || app.snapshot?.desktop_running == true || app.snapshot?.pending != nil)
+                Text("Codex 重新扫描后如果路由又错位，用这个入口。")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             Divider()
             DisclosureGroup("DeepSeek 密钥设置（仅需首次或更换密钥）") {
                 VStack(alignment:.leading,spacing:8) {
@@ -221,7 +233,10 @@ struct ContentView: View {
                             .disabled(app.key.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty || app.busy || app.snapshot?.desktop_running == true)
                     }
                     if app.snapshot?.key_configured == true {
-                        Label("本机已保存 DeepSeek 密钥，可以直接切换；只有换密钥时才需要重新填写。",systemImage:"checkmark.seal")
+                        Label(app.snapshot?.key_storage == "keychain" ?
+                              "密钥已存入 macOS 钥匙串；配置文件保留一份供 Codex 读取，备份会脱敏。" :
+                              "本机已保存 DeepSeek 密钥，可以直接切换；只有换密钥时才需要重新填写。",
+                              systemImage:"checkmark.seal")
                             .font(.caption).foregroundStyle(.green)
                     }
                     if app.snapshot?.desktop_running == true {
@@ -232,7 +247,7 @@ struct ContentView: View {
                         Label("无法确认 ChatGPT 是否在运行（系统拒绝了进程查询）。请先确认已完全退出，再保存。",systemImage:"exclamationmark.triangle")
                             .font(.caption).foregroundStyle(.orange)
                     }
-                    Text("密钥只写进本机 ~/.codex/config.toml，不上传；粘贴时带进来的空格、换行或 Bearer 前缀会自动清理。")
+                    Text("密钥保存在 macOS 钥匙串，并写入 ~/.codex/config.toml 供 Codex 读取；备份中的密钥会脱敏，不上传。粘贴时带进来的空格、换行或 Bearer 前缀会自动清理。")
                         .font(.caption).foregroundStyle(.secondary)
                 }.padding(.top,8)
             }

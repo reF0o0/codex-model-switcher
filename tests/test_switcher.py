@@ -10,6 +10,7 @@ import contextlib
 sys.path.insert(0, str(pathlib.Path(__file__).parents[1] / 'src'))
 from switcher.core import Switcher, rewrite_config
 from switcher.backups import BackupStore
+from switcher.keychain import KeychainError
 
 
 @contextlib.contextmanager
@@ -18,6 +19,22 @@ def db_connection(path):
     try:
         with con:yield con
     finally:con.close()
+
+
+class FakeKeychain:
+    def __init__(self):
+        self.value=None
+        self.fail=False
+
+    def get(self):
+        return self.value
+
+    def set(self,key):
+        if self.fail:raise KeychainError('测试里模拟钥匙串失败')
+        self.value=key
+
+    def delete(self):
+        self.value=None
 
 
 class CodexHomeFixture(unittest.TestCase):
@@ -39,7 +56,8 @@ class CodexHomeFixture(unittest.TestCase):
             db.executemany('insert into threads values(?,?,?,?,?,?,?)',[
                 ('a','deepseek','deepseek-flash','high',0,'C学习',str(self.home/'sessions'/'one.jsonl')),
                 ('b','custom','deepseek-flash','high',1,'归档',str(self.home/'sessions'/'one.jsonl'))])
-        self.app = Switcher(self.home, require_closed=False)
+        self.keychain=FakeKeychain()
+        self.app = Switcher(self.home, require_closed=False, keychain=self.keychain)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -251,6 +269,47 @@ class KeyInputTests(CodexHomeFixture):
         self.assertEqual(self.saved_key(),'my-relay-key-123456')
         self.assertIn('不以 sk- 开头',result['message'])
 
+    def test_key_is_stored_in_keychain_and_snapshot_redacts_it(self):
+        result=self.app.save_key('sk-0123456789abcdef')
+        self.assertEqual(self.keychain.value,'sk-0123456789abcdef')
+        self.assertEqual(result['key_storage'],'keychain')
+        snapshot=self.app.snapshot()
+        blob=self.app.store.content(snapshot['id'],'config.toml').decode()
+        self.assertNotIn('sk-0123456789abcdef',blob)
+        self.assertIn('stored-in-keychain',blob)
+
+    def test_keychain_failure_keeps_config_working_with_a_warning(self):
+        self.keychain.fail=True
+        result=self.app.save_key('sk-0123456789abcdef')
+        self.assertEqual(self.saved_key(),'sk-0123456789abcdef')
+        self.assertEqual(result['key_storage'],'config')
+        self.assertIn('钥匙串',result['message'])
+
+
+class RepairTests(CodexHomeFixture):
+    def test_switch_uses_keychain_key_when_config_token_was_removed(self):
+        self.keychain.value='sk-keychain-0123456789'
+        path=self.home/'config.toml'
+        path.write_text(path.read_text().replace('experimental_bearer_token="test-secret"','experimental_bearer_token="removed"'))
+        self.app.switch('deepseek','deepseek-flash','high')
+        import tomllib
+        config=tomllib.loads(path.read_text())
+        self.assertEqual(config['model_providers']['deepseek']['experimental_bearer_token'],'sk-keychain-0123456789')
+
+    def test_repair_aligns_routes_without_changing_config(self):
+        path=self.home/'config.toml'
+        before=path.read_bytes()
+        with db_connection(self.home/'state_5.sqlite') as db:
+            db.execute("update threads set model_provider='openai',model='gpt-5.6-sol',reasoning_effort='low' where id='a'")
+        backups=len(self.app.store.list())
+        result=self.app.repair()
+        self.assertEqual(path.read_bytes(),before)
+        self.assertGreaterEqual(result['repaired'],1)
+        self.assertEqual(len(self.app.store.list()),backups+1)
+        with db_connection(self.home/'state_5.sqlite') as db:
+            row=db.execute("select model_provider,model,reasoning_effort from threads where id='a'").fetchone()
+        self.assertEqual(tuple(row),('deepseek','deepseek-flash','high'))
+
 
 class ProcessProbeTests(CodexHomeFixture):
     """An unreadable process list must never turn the whole tool into one opaque error."""
@@ -274,14 +333,14 @@ class ProcessProbeTests(CodexHomeFixture):
 
     def test_key_save_is_blocked_with_a_clear_message_when_the_probe_is_unavailable(self):
         from unittest.mock import patch
-        closed=Switcher(self.home, require_closed=True)
+        closed=Switcher(self.home, require_closed=True, keychain=self.keychain)
         with patch('switcher.core._process_lines',return_value=None):
             with self.assertRaises(ValueError) as caught:closed.save_key('sk-test-0123456789')
         self.assertIn('无法确认',str(caught.exception))
 
     def test_key_save_is_blocked_while_chatgpt_is_running(self):
         from unittest.mock import patch
-        closed=Switcher(self.home, require_closed=True)
+        closed=Switcher(self.home, require_closed=True, keychain=self.keychain)
         with patch('switcher.core._process_lines',return_value=['/Applications/ChatGPT.app/Contents/MacOS/ChatGPT']):
             with self.assertRaises(ValueError) as caught:closed.save_key('sk-test-0123456789')
         self.assertIn('⌘Q',str(caught.exception))

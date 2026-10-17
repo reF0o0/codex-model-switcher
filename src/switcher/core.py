@@ -15,6 +15,7 @@ import uuid
 from urllib.parse import urlparse
 
 from .backups import BackupStore, atomic_write, sync_directory
+from .keychain import Keychain, KeychainError
 
 
 class ManagedConnection(sqlite3.Connection):
@@ -26,6 +27,7 @@ MANAGED = ('model_provider', 'model', 'model_reasoning_effort', 'model_catalog_j
            'preferred_auth_method', 'forced_login_method', 'disable_response_storage')
 MODELS = {'openai': ['gpt-6.1-sol','gpt-6-sol','gpt-6-luna','gpt-6-astra'],
           'deepseek': ['deepseek-flash','deepseek-v4-pro']}
+SECRET_LINE = re.compile(r'^\s*(experimental_bearer_token|api_key)\s*=')
 
 
 def migration_providers(config):
@@ -65,6 +67,34 @@ def provider_auth_config(text):
     if alias is None:return text.rstrip()+'\n\n'+table
     alias_end=next((i for i in range(alias+1,len(lines)) if lines[i].lstrip().startswith('[')),len(lines))
     return ''.join(lines[:alias])+table+''.join(lines[alias_end:])
+
+
+def redact_config(text):
+    """Keep snapshots readable while removing credentials from them."""
+    lines=[]
+    for line in text.splitlines(keepends=True):
+        if SECRET_LINE.match(line):
+            lines.append(line.split('=',1)[0]+' = "<stored-in-keychain>"\n')
+        else:lines.append(line)
+    return ''.join(lines)
+
+
+def configured_key(provider):
+    value=provider.get('experimental_bearer_token') if isinstance(provider,dict) else None
+    return value if isinstance(value,str) and value.strip() and value not in ('removed','<stored-in-keychain>') else None
+
+
+def set_deepseek_key(text,key):
+    """Update (or create) the canonical DeepSeek provider and its auth alias."""
+    lines=text.splitlines(keepends=True)
+    start=next((i for i,s in enumerate(lines) if s.strip()=='[model_providers.deepseek]'),None)
+    if start is None:
+        text+='\n[model_providers.deepseek]\nname="DeepSeek"\nbase_url="https://api.deepseek.com/"\nwire_api="responses"\nexperimental_bearer_token='+json.dumps(key)+'\n'
+    else:
+        end=next((i for i in range(start+1,len(lines)) if lines[i].lstrip().startswith('[')),len(lines))
+        body=[s for s in lines[start+1:end] if not re.match(r'^\s*experimental_bearer_token\s*=',s)]
+        text=''.join(lines[:start+1])+'experimental_bearer_token='+json.dumps(key)+'\n'+''.join(body)+''.join(lines[end:])
+    return provider_auth_config(text)
 
 
 def _process_lines():
@@ -155,9 +185,10 @@ def replace_header(path, header):
 
 
 class Switcher:
-    def __init__(self, home=None, require_closed=True):
+    def __init__(self, home=None, require_closed=True, keychain=None):
         self.home=Path(home or Path.home()/'.codex').expanduser().resolve()
         self.require_closed=require_closed
+        self.keychain=keychain or Keychain()
         self.data=self.home/'provider-switcher'
         self.data.mkdir(mode=0o700,exist_ok=True)
         sync_directory(self.home)
@@ -211,7 +242,8 @@ class Switcher:
         files={}
         for name in ['config.toml','models.json']:
             path=self.home/name
-            if path.is_file():files[name]=path
+            if path.is_file():
+                files[name]=redact_config(path.read_text()).encode() if name=='config.toml' else path
         links=self.data/'links.json'
         if links.is_file():files['provider-switcher/links.json']=links
         exports=self.data/'continuations'
@@ -306,6 +338,11 @@ class Switcher:
         if provider=='deepseek' and effort=='medium':raise ValueError('DeepSeek 请选择 low 或 high')
         with self.lock():
             text=self.config.read_text()
+            if provider=='deepseek':
+                current=tomllib.loads(text).get('model_providers',{}).get('deepseek',{})
+                stored=self.keychain.get()
+                if stored and not configured_key(current):
+                    text=set_deepseek_key(text,stored)
             cfg=tomllib.loads(text)
             values={k:None for k in MANAGED}
             values.update(model_provider=provider,model=model,model_reasoning_effort=effort)
@@ -313,7 +350,7 @@ class Switcher:
             values['model_provider']=stored_provider
             if provider=='deepseek':
                 p=cfg.get('model_providers',{}).get('deepseek',{})
-                if not (p.get('experimental_bearer_token') or (p.get('env_key') and os.environ.get(p['env_key']))):
+                if not (configured_key(p) or (p.get('env_key') and os.environ.get(p['env_key']))):
                     raise ValueError('DeepSeek API key 未配置，请在密钥设置中保存')
                 catalog=self.home/'models.json'
                 if not catalog.is_file() or not set(MODELS['deepseek']) <= {m['slug'] for m in json.loads(catalog.read_text())['models']}:
@@ -342,7 +379,11 @@ class Switcher:
             if values.get('model_provider') in deepseek_ids:
                 values['model_provider']='ds_api'
             text=rewrite_config(self.config.read_text(),values)
-            if any(r['model_provider']=='ds_api' for r in routes):text=provider_auth_config(text)
+            if any(r['model_provider']=='ds_api' for r in routes):
+                stored=self.keychain.get()
+                current=tomllib.loads(text).get('model_providers',{}).get('deepseek',{})
+                text=(set_deepseek_key(text,stored) if stored and not configured_key(current)
+                      else provider_auth_config(text))
             updates=self.header_updates(routes)
             # New threads and all message history are deliberately left in place.
             safety=self.snapshot()
@@ -351,26 +392,52 @@ class Switcher:
             return {'restored':ident,'backup_id':safety['id'],'removed':len(removed),
                     'message':'已恢复模型和服务商设置；恢复点之后的新会话、新消息均保留。'}
 
+    def repair(self):
+        """Re-align session routes with the current config without changing models."""
+        with self.lock():
+            text=self.config.read_text()
+            cfg=tomllib.loads(text)
+            provider=cfg.get('model_provider','openai')
+            if provider not in ('openai','deepseek','ds_api'):
+                raise ValueError('当前配置不是 GPT 或 DeepSeek 服务商，无法修复')
+            model=cfg.get('model','gpt-6.1-sol')
+            effort=cfg.get('model_reasoning_effort','high')
+            routes=self.routes()
+            affected=[r for r in routes if r['model_provider'] in migration_providers(cfg)]
+            updated=[{**r,'model_provider':provider,'model':model,'reasoning_effort':effort} for r in affected]
+            changed=[r for r in affected if (r['model_provider'],r['model'],r['reasoning_effort'])!=(provider,model,effort)]
+            updates=self.header_updates(updated)
+            logical='deepseek' if provider in ('ds_api','deepseek') else 'openai'
+            if not changed and not updates:
+                return {'repaired':0,'provider':logical,'model':model,
+                        'message':'配置和会话路由已经一致，无需修复。'}
+            snapshot=self.snapshot()
+            self._apply(text,updated,snapshot['id'],updates)
+            removed=self._cleanup() if self.settings()['auto_cleanup'] else []
+            return {'backup_id':snapshot['id'],'repaired':len(changed),'provider':logical,
+                    'model':model,'removed':len(removed),'headers':len(updates),
+                    'message':'已修复 '+str(len(changed))+' 条数据库路由、'+str(len(updates))+' 个会话文件头；模型保持 '+model+'。'}
+
     def save_key(self,raw):
         key,note=normalize_key(raw)
         with self.lock():
+            storage='config'
+            try:
+                self.keychain.set(key)
+                storage='keychain'
+            except KeychainError as exc:
+                note=(note+'；' if note else '')+str(exc)
             text=self.config.read_text()
-            lines=text.splitlines(keepends=True)
-            start=next((i for i,s in enumerate(lines) if s.strip()=='[model_providers.deepseek]'),None)
-            if start is None:
-                text+='\n[model_providers.deepseek]\nname="DeepSeek"\nbase_url="https://api.deepseek.com/"\nwire_api="responses"\nexperimental_bearer_token='+json.dumps(key)+'\n'
-            else:
-                end=next((i for i in range(start+1,len(lines)) if lines[i].lstrip().startswith('[')),len(lines))
-                body=[s for s in lines[start+1:end] if not re.match(r'^\s*experimental_bearer_token\s*=',s)]
-                text=''.join(lines[:start+1])+'experimental_bearer_token='+json.dumps(key)+'\n'+''.join(body)+''.join(lines[end:])
-            text=provider_auth_config(text)
+            text=set_deepseek_key(text,key)
             tomllib.loads(text)
             snapshot=self.snapshot()
             atomic_write(self.config,text.encode())
             if self.settings()['auto_cleanup']:self._cleanup()
-            message='DeepSeek 密钥已保存到本机配置；ChatGPT 登录未更改。'
+            message=('DeepSeek 密钥已保存到 macOS 钥匙串，并写入配置供 Codex 读取；ChatGPT 登录未更改。'
+                     if storage=='keychain' else
+                     'DeepSeek 密钥已保存到本机配置；钥匙串不可用，未存储第二份。ChatGPT 登录未更改。')
             if note:message+='（'+note+'）'
-            return {'backup_id':snapshot['id'],'key_configured':True,'message':message}
+            return {'backup_id':snapshot['id'],'key_configured':True,'key_storage':storage,'message':message}
 
     def transcript(self,tid):
         database=self.home/'thread_history_1.sqlite'
@@ -455,12 +522,15 @@ class Switcher:
         provider=config.get('model_provider','openai')
         state=desktop_state()
         deepseek_config=config.get('model_providers',{}).get('deepseek',{})
-        key_configured=bool(deepseek_config.get('experimental_bearer_token') or
-                            (deepseek_config.get('env_key') and os.environ.get(deepseek_config['env_key'])))
+        config_key=bool(configured_key(deepseek_config) or
+                        (deepseek_config.get('env_key') and os.environ.get(deepseek_config['env_key'])))
+        keychain_key=self.keychain.get()
+        key_configured=bool(keychain_key or config_key)
+        key_storage='keychain' if keychain_key else ('config' if config_key else 'none')
         return {'provider':'deepseek' if provider=='ds_api' else provider,'model':config.get('model','默认'),
                 'effort':config.get('model_reasoning_effort','默认'),'threads':threads,
                 'backups':[{'id':s['id'],'created_at':s['created_at'],'files':len(s['files'])} for s in snapshots],
                 'settings':self.settings(),'desktop_running':state=='running','desktop_check':state,
                 'pending':json.loads(self.pending.read_text()) if self.pending.exists() else None,
                 'backup_path':str(self.store.root),
-                'key_configured':key_configured}
+                'key_configured':key_configured,'key_storage':key_storage}
