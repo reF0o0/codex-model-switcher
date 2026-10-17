@@ -10,6 +10,7 @@ import tempfile
 import tomllib
 import shutil
 import time
+import unicodedata
 import uuid
 from urllib.parse import urlparse
 
@@ -90,26 +91,34 @@ def desktop_running():
     return desktop_state()=='running'
 
 
-KEY_PATTERN=re.compile(r'^[A-Za-z0-9][A-Za-z0-9._\-]{5,255}$')
-INVISIBLE='\u200b\u200c\u200d\u2060\ufeff\u00a0'
+KEY_PATTERN=re.compile(r'^[A-Za-z0-9][A-Za-z0-9._\-]*$')
+KEY_TOKEN=re.compile(r'sk-[A-Za-z0-9._\-]{6,}')
+DASHES='\u2010\u2011\u2012\u2013\u2014\u2212\uff0d'
+QUOTES='"\'`\u2018\u2019\u201c\u201d\u300c\u300d\u300e\u300f'
 
 
 def normalize_key(raw):
     """Accept what people actually paste, and say exactly what is wrong when we cannot."""
     if not isinstance(raw,str):raise ValueError('API key 格式无效：没有收到密钥内容，请重新粘贴')
-    text=raw.strip()
+    text=unicodedata.normalize('NFKC',raw).strip()
+    for dash in DASHES:text=text.replace(dash,'-')
     if text[:7].lower()=='bearer ':text=text[7:].strip()
-    if len(text)>1 and text[0]==text[-1] and text[0] in '"\'':text=text[1:-1].strip()
+    if len(text)>1 and text[0]==text[-1] and text[0] in QUOTES:text=text[1:-1].strip()
     if not text:raise ValueError('API key 格式无效：输入框是空的，请粘贴 DeepSeek 控制台里的密钥（通常以 sk- 开头）')
-    key=''.join(c for c in text if not (c.isspace() or c in INVISIBLE))
+    key=''.join(c for c in text if not (c.isspace() or unicodedata.category(c) in ('Cc','Cf')))
     removed=len(text)-len(key)
     if not key:raise ValueError('API key 格式无效：只收到空白字符，请重新复制密钥')
+    match=KEY_TOKEN.search(key)
+    if match and match.group(0)!=key:
+        removed+=len(key)-len(match.group(0))
+        key=match.group(0)
+    if len(key)<6:raise ValueError('API key 格式无效：只收到 '+str(len(key))+' 个字符；完整密钥通常以 sk- 开头、共 35 个字符，请从 DeepSeek 控制台整段复制')
     if len(key)>256:raise ValueError('API key 格式无效：收到 '+str(len(key))+' 个字符，远超正常密钥长度，请只粘贴 sk- 开头的那一段')
     if not KEY_PATTERN.match(key):
         bad=sorted({c for c in key if not re.match(r'[A-Za-z0-9._\-]',c)})
         sample='、'.join('U+%04X %s'%(ord(c),c) for c in bad[:4])
         raise ValueError('API key 格式无效：密钥中含有不允许的字符（'+sample+'）；请从 DeepSeek 控制台重新复制，不要带上中文标点或引号')
-    note='已自动移除粘贴带进来的 '+str(removed)+' 个空白或不可见字符' if removed else ''
+    note='已自动移除粘贴带进来的 '+str(removed)+' 个空白或多余字符' if removed else ''
     if not key.startswith('sk-'):note=(note+'；' if note else '')+'提醒：该密钥不以 sk- 开头，如调用失败请重新复制'
     return key,note
 

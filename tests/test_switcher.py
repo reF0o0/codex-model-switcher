@@ -213,12 +213,28 @@ class KeyInputTests(CodexHomeFixture):
         self.assertEqual(self.saved_key(),'sk-01234567')
         self.assertIn('已自动移除',result['message'])
 
+    def test_label_full_width_punctuation_and_quotes_around_key_are_cleaned(self):
+        result=self.app.save_key('DeepSeek API Key： “sk－0123456789abcdef”')
+        self.assertEqual(self.saved_key(),'sk-0123456789abcdef')
+        self.assertIn('已自动移除',result['message'])
+
+    def test_multiline_paste_keeps_the_key_token(self):
+        result=self.app.save_key('名称：deepseek\n密钥：sk-0123456789abcdef\n')
+        self.assertEqual(self.saved_key(),'sk-0123456789abcdef')
+        self.assertIn('已自动移除',result['message'])
+
+    def test_short_input_reports_length_instead_of_a_blank_character_list(self):
+        with self.assertRaises(ValueError) as caught:self.app.save_key('sk-12')
+        message=str(caught.exception)
+        self.assertIn('只收到 5 个字符',message)
+        self.assertNotIn('（）',message)
+
     def test_empty_input_explains_itself(self):
         with self.assertRaises(ValueError) as caught:self.app.save_key('  \n ')
         self.assertIn('空的',str(caught.exception))
 
     def test_non_ascii_key_is_reported_with_the_offending_codes(self):
-        with self.assertRaises(ValueError) as caught:self.app.save_key('sk-密钥')
+        with self.assertRaises(ValueError) as caught:self.app.save_key('sk-密钥abcdef')
         message=str(caught.exception)
         self.assertIn('不允许的字符',message)
         self.assertIn('U+5BC6',message)
