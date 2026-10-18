@@ -9,10 +9,21 @@ mkdir -p "$task_build_app/Contents/MacOS" "$task_build_app/Contents/Resources/ba
 /usr/bin/swiftc -parse-as-library -O -target arm64-apple-macosx14.0 \
   "$task_root/app/App.swift" -o "$task_build_app/Contents/MacOS/ProviderSwitcher"
 /usr/bin/rsync -a --exclude __pycache__ --exclude '*.pyc' "$task_root/src/" "$task_build_app/Contents/Resources/backend/"
+task_iconset="$task_staging/AppIcon.iconset"
+mkdir -p "$task_iconset"
+for task_size in 16 32 128 256 512; do
+  /usr/bin/sips -z "$task_size" "$task_size" "$task_root/assets/AppIcon.png" \
+    --out "$task_iconset/icon_${task_size}x${task_size}.png" >/dev/null
+  task_retina=$((task_size * 2))
+  /usr/bin/sips -z "$task_retina" "$task_retina" "$task_root/assets/AppIcon.png" \
+    --out "$task_iconset/icon_${task_size}x${task_size}@2x.png" >/dev/null
+done
+/usr/bin/iconutil -c icns "$task_iconset" -o "$task_build_app/Contents/Resources/AppIcon.icns"
 /usr/bin/plutil -create xml1 "$task_build_app/Contents/Info.plist"
 /usr/bin/plutil -insert CFBundleIdentifier -string io.github.ref0o0.codex-model-switcher "$task_build_app/Contents/Info.plist"
 /usr/bin/plutil -insert CFBundleExecutable -string ProviderSwitcher "$task_build_app/Contents/Info.plist"
 /usr/bin/plutil -insert CFBundleName -string 'Codex 模型切换器' "$task_build_app/Contents/Info.plist"
+/usr/bin/plutil -insert CFBundleIconFile -string AppIcon "$task_build_app/Contents/Info.plist"
 /usr/bin/plutil -insert CFBundlePackageType -string APPL "$task_build_app/Contents/Info.plist"
 /usr/bin/plutil -insert CFBundleShortVersionString -string "$task_version" "$task_build_app/Contents/Info.plist"
 /usr/bin/plutil -insert CFBundleVersion -string "$task_version" "$task_build_app/Contents/Info.plist"

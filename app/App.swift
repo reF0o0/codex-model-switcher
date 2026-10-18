@@ -171,7 +171,8 @@ struct ContentView: View {
     var body: some View {
         VStack(alignment:.leading,spacing:18) {
             HStack(spacing:12) {
-                Image(systemName:"arrow.triangle.2.circlepath.circle.fill").font(.system(size:38)).foregroundStyle(.blue)
+                Image(nsImage:NSWorkspace.shared.icon(forFile:Bundle.main.bundlePath))
+                    .resizable().interpolation(.high).frame(width:44,height:44)
                 VStack(alignment:.leading,spacing:4) {
                     Text("Codex 模型切换器").font(.title2.bold())
                     Text("GPT · DeepSeek · 同一份历史").foregroundStyle(.secondary)

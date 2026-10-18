@@ -1,5 +1,7 @@
 # Codex 模型切换器
 
+<img src="assets/AppIcon.png" width="128" alt="Codex 模型切换器图标">
+
 一个 macOS 本地工具，把 Codex 的模型、服务商和旧会话路由一起切换。
 从 GPT 换到 DeepSeek，再换回来，以前的会话还能找到；切换前自动备份，旧备份按数量和时间清理。
 
