@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 
 from .backups import BackupStore, atomic_write, sync_directory
 from .keychain import Keychain, KeychainError
+from .compatibility import Change, describe, plan_repairs, replace_ranges, restore_changes
 
 
 class ManagedConnection(sqlite3.Connection):
@@ -238,7 +239,7 @@ class Switcher:
         with self.connect(True) as con:
             return [dict(r) for r in con.execute('select id,model_provider,model,reasoning_effort from threads')]
 
-    def snapshot(self):
+    def snapshot(self,compatibility=None):
         files={}
         for name in ['config.toml','models.json']:
             path=self.home/name
@@ -268,7 +269,13 @@ class Switcher:
                         with sqlite3.connect(target,factory=ManagedConnection) as dst:src.backup(dst)
                     os.chmod(target,0o600)
                     files[name]=target
-            return self.store.create(files,self.routes())
+            manifest=self.store.create(files,self.routes())
+            if compatibility:
+                manifest['compatibility']={str(p.relative_to(self.home)):describe(changes)
+                                           for p,changes in compatibility.items()}
+                atomic_write(self.store.root/manifest['id']/'manifest.json',
+                             json.dumps(manifest,ensure_ascii=False).encode())
+            return manifest
 
     def cleanup(self):
         with self.lock(allow_pending=True,closed=False):return self._cleanup()
@@ -278,7 +285,7 @@ class Switcher:
         protected=[]
         if self.pending.exists():
             journal=json.loads(self.pending.read_text())
-            protected=[journal[k] for k in ['backup_id','safety_backup_id'] if k in journal]
+            protected=[journal[k] for k in ['backup_id','safety_backup_id','compatibility_backup_id'] if k in journal]
         return self.store.prune(settings['keep'],settings['days'],protected=protected)
 
     def backup(self):
@@ -306,26 +313,88 @@ class Switcher:
                     updates.append((path,line,header_for_provider(line,by_id[ident])))
         return updates
 
-    def _apply(self,text,routes,backup_id,updates,recovery_id=None):
-        if self.require_closed and desktop_running():raise ValueError('备份期间 Codex 又被打开，已停止迁移。请退出并重试。')
+    def compatibility_updates(self,routes,strict=True):
+        selected={r['id'] for r in routes}
+        plans={}
+        scanned=set()
+        skipped=[]
+        for category in ['sessions','archived_sessions']:
+            base=self.home/category
+            if base.is_symlink():raise ValueError('会话目录不能是符号链接')
+            if not base.exists():continue
+            for path in base.rglob('*.jsonl'):
+                if path.is_symlink() or not path.resolve().is_relative_to(base.resolve()):
+                    raise ValueError('会话路径越界')
+                with path.open('rb') as stream:header=json.loads(stream.readline())
+                payload=header.get('payload',{})
+                ident=payload.get('id',payload.get('session_id'))
+                if header.get('type')!='session_meta' or ident not in selected:continue
+                scanned.add(ident)
+                try:changes=plan_repairs(path)
+                except ValueError as exc:
+                    if strict:raise
+                    skipped.append({'id':ident,'file':path.name,'reason':str(exc)})
+                    continue
+                if changes:plans[path]=changes
+        blocked={s['id'] for s in skipped}
+        for path in list(plans):
+            with path.open('rb') as stream:payload=json.loads(stream.readline())['payload']
+            if payload.get('id',payload.get('session_id')) in blocked:del plans[path]
+        missing=selected-scanned
+        stats={'scanned':len(scanned),'threads':len(plans),
+               'records':sum(len(v) for v in plans.values()),'unavailable':len(missing),'skipped':skipped}
+        return plans,stats
+
+    def compatibility_restore(self,manifest):
+        plans={}
+        for name,spans in manifest.get('compatibility',{}).items():
+            relative=Path(name)
+            if relative.is_absolute() or '..' in relative.parts or relative.parts[0] not in ('sessions','archived_sessions'):
+                raise ValueError('修复备份路径越界')
+            path=self.home/relative
+            if path.is_symlink() or not path.resolve().is_relative_to(self.home):
+                raise ValueError('修复会话路径越界')
+            if not path.is_file():raise ValueError('待恢复的修复会话文件已不在原位置')
+            changes=restore_changes(path,self.store.content(manifest['id'],name),spans)
+            if changes:plans[path]=changes
+        return plans
+
+    def _apply(self,text,routes,backup_id,updates,recovery_id=None,compatibility=None):
+        if self.require_closed and desktop_state()!='stopped':
+            raise ValueError('备份后无法确认 Codex 已退出，已停止写入。请退出并重试。')
         before=self.config.read_bytes()
-        if recovery_id is None and self.pending.exists():recovery_id=json.loads(self.pending.read_text())['backup_id']
-        atomic_write(self.pending,json.dumps({'backup_id':recovery_id or backup_id,'safety_backup_id':backup_id}).encode())
+        previous=json.loads(self.pending.read_text()) if self.pending.exists() else {}
+        if recovery_id is None and previous:recovery_id=previous['backup_id']
+        journal={'backup_id':recovery_id or backup_id,'safety_backup_id':backup_id}
+        if previous.get('compatibility_backup_id'):
+            journal['compatibility_backup_id']=previous['compatibility_backup_id']
+        elif compatibility:journal['compatibility_backup_id']=backup_id
+        plans={p:list(changes) for p,changes in (compatibility or {}).items()}
+        for path,old,new in updates:plans.setdefault(path,[]).insert(0,Change(0,old,new))
         con=self.connect()
+        atomic_write(self.pending,json.dumps(journal).encode())
         changed=[]
         try:
             con.execute('begin immediate')
-            for path,old,new in updates:
-                replace_header(path,new)
-                changed.append((path,old))
+            for path,changes in plans.items():
+                changed.append((path,changes))
+                replace_ranges(path,changes)
             for row in routes:
                 con.execute('update threads set model_provider=?,model=?,reasoning_effort=? where id=?',
                             (row['model_provider'],row['model'],row['reasoning_effort'],row['id']))
             atomic_write(self.config,text.encode())
             con.commit()
-        except BaseException:
+        except Exception:
             con.rollback()
-            for path,old in reversed(changed):replace_header(path,old)
+            for path,changes in reversed(changed):
+                inverse=[]
+                with path.open('rb') as stream:
+                    for change in changes:
+                        stream.seek(change.offset)
+                        current=stream.read(len(change.before))
+                        if current==change.after:inverse.append(change.reverse())
+                        elif current!=change.before:raise ValueError('会话已变化，请从备份恢复未完成的操作')
+                if inverse:replace_ranges(path,inverse)
             atomic_write(self.config,before)
             raise
         finally:con.close()
@@ -362,12 +431,19 @@ class Switcher:
             # Other custom providers remain untouched; only the user's GPT/DeepSeek groups migrate.
             affected=[r for r in routes if r['model_provider'] in migration_providers(cfg)]
             updated=[{**r,'model_provider':stored_provider,'model':model,'reasoning_effort':effort} for r in affected]
+            compatibility,stats=(self.compatibility_updates(updated,strict=False) if provider=='openai'
+                                 else ({},{'scanned':0,'threads':0,'records':0,'unavailable':0,'skipped':[]}))
+            blocked={s['id'] for s in stats['skipped']}
+            updated=[r for r in updated if r['id'] not in blocked]
             updates=self.header_updates(updated)
-            snapshot=self.snapshot()
-            self._apply(text,updated,snapshot['id'],updates)
+            snapshot=self.snapshot(compatibility)
+            self._apply(text,updated,snapshot['id'],updates,compatibility=compatibility)
             removed=self._cleanup() if self.settings()['auto_cleanup'] else []
             return {'backup_id':snapshot['id'],'migrated':len(updated),'removed':len(removed),
-                    'provider':provider,'model':model,'message':'切换完成；现在可以重新打开 ChatGPT。'}
+                    'provider':provider,'model':model,'compatibility':stats,
+                    'message':'已切换 '+str(len(updated))+' 个会话；自动修复 '+str(stats['threads'])+' 个会话、'+str(stats['records'])+' 条推理记录。'+
+                    (('已跳过 '+str(len(blocked))+' 个未知格式会话（见处理明细），原文件和路由保留。') if blocked else '')+
+                    (('另有 '+str(stats['unavailable'])+' 个会话未找到本机文件，未检查格式。') if stats['unavailable'] else '')+'现在可以打开 ChatGPT。'}
 
     def restore(self,ident):
         with self.lock(allow_pending=True):
@@ -385,12 +461,40 @@ class Switcher:
                 text=(set_deepseek_key(text,stored) if stored and not configured_key(current)
                       else provider_auth_config(text))
             updates=self.header_updates(routes)
+            repair_manifest=original
+            if not original.get('compatibility') and self.pending.exists():
+                pending=json.loads(self.pending.read_text())
+                if pending.get('compatibility_backup_id'):
+                    repair_manifest=self.store.verify(pending['compatibility_backup_id'])
+            compatibility=self.compatibility_restore(repair_manifest)
             # New threads and all message history are deliberately left in place.
             safety=self.snapshot()
-            self._apply(text,routes,safety['id'],updates,recovery_id=ident)
+            self._apply(text,routes,safety['id'],updates,recovery_id=ident,compatibility=compatibility)
             removed=self._cleanup() if self.settings()['auto_cleanup'] else []
             return {'restored':ident,'backup_id':safety['id'],'removed':len(removed),
                     'message':'已恢复模型和服务商设置；恢复点之后的新会话、新消息均保留。'}
+
+    def repair_compatibility(self,ident=None):
+        with self.lock():
+            text=self.config.read_text()
+            cfg=tomllib.loads(text)
+            if cfg.get('model_provider','openai')!='openai':
+                raise ValueError('历史格式修复仅适用于 GPT；请先切到 GPT')
+            routes=self.routes()
+            eligible=migration_providers(cfg)
+            selected=[r for r in routes if r['model_provider'] in eligible and (ident is None or r['id']==ident)]
+            if ident is not None and not selected:raise ValueError('找不到可修复的 GPT／DeepSeek 会话')
+            plans,stats=self.compatibility_updates(selected,strict=ident is not None)
+            if ident is not None and stats['unavailable']:
+                raise ValueError('找不到该会话的本机文件，无法检查历史格式')
+            if not plans:
+                return {'compatibility':stats,'message':'检查完成，没有可自动修复的已知格式问题；跳过 '+str(len(stats['skipped']))+' 个未知格式会话、'+str(stats['unavailable'])+' 个缺少本机文件的会话，见处理明细。'}
+            snapshot=self.snapshot(plans)
+            self._apply(text,[],snapshot['id'],[],compatibility=plans)
+            removed=self._cleanup() if self.settings()['auto_cleanup'] else []
+            return {'backup_id':snapshot['id'],'removed':len(removed),'compatibility':stats,
+                    'message':'已修复 '+str(stats['threads'])+' 个原会话、'+str(stats['records'])+' 条推理记录；模型和路由保持不变。'+
+                    (('另有 '+str(len(stats['skipped']))+' 个未知格式会话已跳过，见处理明细。') if stats['skipped'] else '')}
 
     def repair(self):
         """Re-align session routes with the current config without changing models."""

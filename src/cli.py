@@ -4,7 +4,7 @@ import sys
 sys.dont_write_bytecode = True
 from switcher.core import Switcher
 
-PAYLOAD_COMMANDS=['switch','restore','settings','save-key','bridge']
+PAYLOAD_COMMANDS=['switch','restore','settings','save-key','bridge','repair-formats']
 
 
 def payload():
@@ -26,7 +26,7 @@ def require(data,name,what):
 def main():
     p=argparse.ArgumentParser()
     p.add_argument('--home')
-    p.add_argument('command',choices=['status','startup','switch','backup','restore','cleanup','settings','save-key','bridge','repair'])
+    p.add_argument('command',choices=['status','startup','switch','backup','restore','cleanup','settings','save-key','bridge','repair','repair-formats'])
     args=p.parse_args()
     data=payload() if args.command in PAYLOAD_COMMANDS else {}
     app=Switcher(args.home)
@@ -37,6 +37,7 @@ def main():
     elif args.command=='backup':result=app.backup()
     elif args.command=='restore':result=app.restore(require(data,'id','备份 ID'))
     elif args.command=='repair':result=app.repair()
+    elif args.command=='repair-formats':result=app.repair_compatibility(data.get('id'))
     elif args.command=='cleanup':result={'removed':len(app.cleanup())}
     elif args.command=='settings':result=app.save_settings(int(data.get('keep',0)),int(data.get('days',0)),data.get('auto_cleanup',True))
     elif args.command=='bridge':result=app.bridge(require(data,'id','会话 ID'))

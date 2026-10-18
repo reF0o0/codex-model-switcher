@@ -52,6 +52,9 @@ final class AppModel: ObservableObject {
     @Published var confirmSwitch = false
     @Published var confirmRestore = false
     @Published var confirmRepair = false
+    @Published var confirmFormatRepair = false
+    @Published var formatRepairID: String?
+    @Published var report = ""
     @Published var key = ""
     var loaded = false
     let choices = ["openai":["gpt-6.1-sol","gpt-6-sol","gpt-6-luna","gpt-6-astra"],
@@ -93,15 +96,26 @@ final class AppModel: ObservableObject {
             do {
                 var message: String?
                 var newThread: String?
+                var report: String?
                 if command != "status" && command != "startup" {
                     let data = try self.execute(command,payload)
                     let result = try JSONSerialization.jsonObject(with:data) as? [String:Any] ?? [:]
                     newThread = result["thread_id"] as? String
-                    if let n = result["migrated"] as? Int { message = "已切换 \(n) 个会话，内容和归档状态保留。现在可以打开 ChatGPT。" }
-                    else if let m = result["message"] as? String {message = m}
+                    if let m = result["message"] as? String {message = m}
+                    else if let n = result["migrated"] as? Int { message = "已切换 \(n) 个会话，内容和归档状态保留。现在可以打开 ChatGPT。" }
                     else if command == "backup" {message = "完整备份已创建并完成自动清理。"}
                     else if let n = result["removed"] as? Int {message = "已清理 \(n) 份过期备份。"}
                     else {message = "设置已保存。"}
+                    if let stats = result["compatibility"] as? [String:Any] {
+                        var lines = ["检查 \(stats["scanned"] as? Int ?? 0) 个本机会话；修复 \(stats["threads"] as? Int ?? 0) 个会话、\(stats["records"] as? Int ?? 0) 条推理记录。"]
+                        let unavailable = stats["unavailable"] as? Int ?? 0
+                        if unavailable > 0 {lines.append("\(unavailable) 个会话未找到本机文件，未检查历史格式。")}
+                        for skipped in stats["skipped"] as? [[String:String]] ?? [] {
+                            lines.append("跳过 \(skipped["id"] ?? "")：\(skipped["reason"] ?? "未知格式")")
+                        }
+                        if let backup = result["backup_id"] as? String {lines.append("备份：\(backup)")}
+                        report = lines.joined(separator:"\n")
+                    }
                 }
                 let status = try JSONDecoder().decode(Snapshot.self,from:self.execute(command == "startup" ? "startup" : "status"))
                 DispatchQueue.main.async {
@@ -116,6 +130,7 @@ final class AppModel: ObservableObject {
                     if let message = message {self.notice = message}
                     else if command == "startup" {self.notice = "已加载全部历史。切换前先退出 ChatGPT，完成后再重新打开。"}
                     self.busy = false
+                    if let report = report {self.report = report}
                     if let tid = newThread, let url = URL(string:"codex://threads/\(tid)") {NSWorkspace.shared.open(url)}
                 }
             } catch {
@@ -167,6 +182,12 @@ struct ContentView: View {
                 backupView.tabItem {Label("备份与恢复",systemImage:"externaldrive")}.tag(2)
             }
             Divider()
+            if !app.report.isEmpty {
+                DisclosureGroup("处理明细") {
+                    ScrollView {Text(app.report).font(.caption).textSelection(.enabled).frame(maxWidth:.infinity,alignment:.leading)}
+                        .frame(maxHeight:130)
+                }
+            }
             HStack {
                 if app.busy {ProgressView().controlSize(.small)}
                 Text(app.notice).font(.callout).foregroundStyle(.secondary).textSelection(.enabled)
@@ -184,7 +205,7 @@ struct ContentView: View {
         .confirmationDialog("切换全部 GPT／DeepSeek 会话到 \(app.model)？",isPresented:$app.confirmSwitch,titleVisibility:.visible) {
             Button("备份并切换") {app.run("switch",["provider":app.provider,"model":app.model,"effort":app.effort])}
             Button("取消",role:.cancel) {}
-        } message: {Text("保留会话 ID、消息、项目和归档状态。先退出 ChatGPT，完成后再重新打开。")}
+        } message: {Text(app.provider == "openai" ? "先备份，再切换并自动修复已验证的 DeepSeek 推理格式。未知格式会话跳过并保留原路由，完成后查看处理明细。先退出 ChatGPT。" : "保留会话 ID、消息、项目和归档状态。本版尚未处理修复后的推理记录切回 DeepSeek 的兼容问题。先退出 ChatGPT。")}
         .confirmationDialog("恢复选中的模型与服务商设置？",isPresented:$app.confirmRestore,titleVisibility:.visible) {
             Button("创建安全备份并恢复") {if let id=app.restoreID {app.run("restore",["id":id])}}
             Button("取消",role:.cancel) {}
@@ -193,6 +214,14 @@ struct ContentView: View {
             Button("备份并修复") {app.run("repair")}
             Button("取消",role:.cancel) {}
         } message: {Text("保持当前模型和服务商不变，只把 GPT／DeepSeek 会话的文件头与数据库路由重新对齐。")}
+        .confirmationDialog("备份并修复 GPT 历史格式？",isPresented:$app.confirmFormatRepair,titleVisibility:.visible) {
+            Button("备份并修复原会话") {
+                var payload: [String:Any] = [:]
+                if let id = app.formatRepairID {payload["id"] = id}
+                app.run("repair-formats",payload)
+            }
+            Button("取消",role:.cancel) {}
+        } message: {Text("保留原会话 ID、正文、附件引用和工具记录，将匹配的 DeepSeek 推理回放项转为历史展示记录。需要先退出 ChatGPT；此功能不发送模型请求。")}
     }
 
     var switchView: some View {
@@ -218,12 +247,19 @@ struct ContentView: View {
             Button("备份并切换全部会话",systemImage:"arrow.triangle.swap") {app.confirmSwitch=true}
                 .buttonStyle(.borderedProminent).controlSize(.large)
                 .disabled(app.busy || app.snapshot?.desktop_running == true || app.snapshot?.pending != nil)
+            if app.provider == "openai" {
+                Label("切到 GPT 时自动检查历史格式；已知问题修复后继续使用原会话，未知格式会话跳过并列出原因。",systemImage:"checkmark.shield")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             HStack {
                 Button("只修复路由，不切换模型",systemImage:"wrench.and.screwdriver") {app.confirmRepair=true}
                     .disabled(app.busy || app.snapshot?.desktop_running == true || app.snapshot?.pending != nil)
                 Text("Codex 重新扫描后如果路由又错位，用这个入口。")
                     .font(.caption).foregroundStyle(.secondary)
             }
+            Button("检查并修复全部 GPT 历史格式",systemImage:"bandage") {
+                app.formatRepairID=nil;app.confirmFormatRepair=true
+            }.disabled(app.busy || app.snapshot?.provider != "openai" || app.snapshot?.desktop_check != "stopped" || app.snapshot?.pending != nil)
             Divider()
             DisclosureGroup("DeepSeek 密钥设置（仅需首次或更换密钥）") {
                 VStack(alignment:.leading,spacing:8) {
@@ -251,7 +287,7 @@ struct ContentView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }.padding(.top,8)
             }
-            Text("消息正文保持原样；只同步文件头的服务商，并保持字节长度不变。若旧消息格式不兼容，保留原会话后可用新会话接续。")
+            Text("正文、附件引用和工具记录保留；修复保持行号和字节偏移。无法自动修复的会话仍可使用“兼容接续”。")
                 .font(.caption).foregroundStyle(.secondary)
             Spacer()
         }.padding(22).disabled(app.busy)
@@ -280,6 +316,8 @@ struct ContentView: View {
                     }
                     Button("兼容接续") {app.run("bridge",["id":thread.id])}
                         .disabled(app.busy || app.snapshot?.desktop_running == true)
+                    Button("修复格式") {app.formatRepairID=thread.id;app.confirmFormatRepair=true}
+                        .disabled(app.busy || app.snapshot?.provider != "openai" || app.snapshot?.desktop_check != "stopped" || app.snapshot?.pending != nil)
                     Button("复制 ID") {NSPasteboard.general.clearContents();NSPasteboard.general.setString(thread.id,forType:.string)}
                 }.padding(.vertical,4)
             }.listStyle(.inset)
