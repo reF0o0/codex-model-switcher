@@ -245,7 +245,8 @@ struct ContentView: View {
     }
 
     var switchView: some View {
-        VStack(alignment:.leading,spacing:22) {
+        ScrollView {
+            VStack(alignment:.leading,spacing:22) {
             Text("选择下一次使用的模型").font(.headline)
             Picker("服务商",selection:$app.provider) {
                 Text("GPT · ChatGPT 账号额度").tag("openai")
@@ -320,8 +321,8 @@ struct ContentView: View {
             }
             Text("正文、附件引用和工具记录保留；修复保持行号和字节偏移。无法自动修复的会话仍可使用“兼容接续”。")
                 .font(.caption).foregroundStyle(.secondary)
-            Spacer()
-        }.padding(22).disabled(app.busy)
+            }.frame(maxWidth:.infinity,alignment:.leading).padding(22)
+        }.disabled(app.busy)
     }
 
     var historyView: some View {
