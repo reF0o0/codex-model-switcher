@@ -19,6 +19,17 @@ struct Preferences: Decodable {
     let days: Int
     let auto_cleanup: Bool
 }
+struct SkippedRepair: Decodable {
+    let id: String
+    let file: String
+    let reason: String
+}
+struct RestorePreview: Decodable {
+    let threads: Int
+    let records: Int
+    let skipped: [SkippedRepair]
+    let error: String?
+}
 struct Snapshot: Decodable {
     let provider: String
     let model: String
@@ -32,6 +43,7 @@ struct Snapshot: Decodable {
     let backup_path: String
     let key_configured: Bool
     let key_storage: String?
+    let deepseek_restore: RestorePreview?
 }
 
 final class AppModel: ObservableObject {
@@ -59,6 +71,9 @@ final class AppModel: ObservableObject {
     var loaded = false
     let choices = ["openai":["gpt-6.1-sol","gpt-6-sol","gpt-6-luna","gpt-6-astra"],
                    "deepseek":["deepseek-flash","deepseek-v4-pro"]]
+    var switchTitle: String {
+        provider == "deepseek" ? "备份、还原并切到 DeepSeek" : "备份并切换全部会话"
+    }
 
     func execute(_ command: String, _ payload: [String:Any] = [:]) throws -> Data {
         let paths = ["/Library/Frameworks/Python.framework/Versions/3.13/bin/python3",
@@ -208,7 +223,7 @@ struct ContentView: View {
             Button("知道了",role:.cancel) {app.error=nil}
         } message: {Text(app.error ?? "")}
         .confirmationDialog("切换全部 GPT／DeepSeek 会话到 \(app.model)？",isPresented:$app.confirmSwitch,titleVisibility:.visible) {
-            Button("备份并切换") {app.run("switch",["provider":app.provider,"model":app.model,"effort":app.effort])}
+            Button(app.switchTitle) {app.run("switch",["provider":app.provider,"model":app.model,"effort":app.effort])}
             Button("取消",role:.cancel) {}
         } message: {Text(app.provider == "openai" ? "先备份，再切换并自动修复已验证的 DeepSeek 推理格式。未知格式会话跳过并保留原路由，完成后查看处理明细。先退出 ChatGPT。" : "先备份，再切到 DeepSeek，并还原之前修复过的原始推理记录。修复位置被其他操作改动过的会话会跳过并保留现状。先退出 ChatGPT。")}
         .confirmationDialog("恢复选中的模型与服务商设置？",isPresented:$app.confirmRestore,titleVisibility:.visible) {
@@ -249,12 +264,23 @@ struct ContentView: View {
             }
             Text(app.provider == "openai" ? "使用现有 ChatGPT 登录。默认推荐 GPT‑6.1 Sol / High；实际可用型号取决于账号。" : "DeepSeek 请求发送到 api.deepseek.com；ChatGPT 登录凭据会保留。")
                 .font(.callout).foregroundStyle(.secondary)
-            Button("备份并切换全部会话",systemImage:"arrow.triangle.swap") {app.confirmSwitch=true}
+            Button(app.switchTitle,systemImage:"arrow.triangle.swap") {app.confirmSwitch=true}
                 .buttonStyle(.borderedProminent).controlSize(.large)
                 .disabled(app.busy || app.snapshot?.desktop_running == true || app.snapshot?.pending != nil)
             if app.provider == "openai" {
                 Label("切到 GPT 时自动检查历史格式；已知问题修复后继续使用原会话，未知格式会话跳过并列出原因。",systemImage:"checkmark.shield")
                     .font(.caption).foregroundStyle(.secondary)
+            } else if let preview = app.snapshot?.deepseek_restore {
+                if let error = preview.error {
+                    Label(error,systemImage:"exclamationmark.triangle").font(.caption).foregroundStyle(.orange)
+                } else {
+                    Label("待还原：\(preview.threads) 个会话、\(preview.records) 条原始推理记录。",systemImage:"arrow.uturn.backward.circle")
+                        .font(.caption).foregroundStyle(.secondary)
+                    if !preview.skipped.isEmpty {
+                        Text("另有 \(preview.skipped.count) 个会话暂时无法还原，切换时会保留原状并列出原因。")
+                            .font(.caption).foregroundStyle(.orange)
+                    }
+                }
             }
             HStack {
                 Button("只修复路由，不切换模型",systemImage:"wrench.and.screwdriver") {app.confirmRepair=true}

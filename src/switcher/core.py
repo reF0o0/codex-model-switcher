@@ -239,7 +239,7 @@ class Switcher:
         with self.connect(True) as con:
             return [dict(r) for r in con.execute('select id,model_provider,model,reasoning_effort from threads')]
 
-    def snapshot(self,compatibility=None):
+    def snapshot(self,compatibility=None,file_changes=None):
         files={}
         for name in ['config.toml','models.json']:
             path=self.home/name
@@ -270,9 +270,14 @@ class Switcher:
                     os.chmod(target,0o600)
                     files[name]=target
             manifest=self.store.create(files,self.routes())
-            if compatibility:
-                manifest['compatibility']={str(p.relative_to(self.home)):describe(changes)
-                                           for p,changes in compatibility.items()}
+            journal_changes=file_changes if file_changes is not None else compatibility
+            if compatibility or journal_changes:
+                if compatibility:
+                    manifest['compatibility']={str(p.relative_to(self.home)):describe(changes)
+                                               for p,changes in compatibility.items()}
+                if journal_changes:
+                    manifest['file_changes']={str(p.relative_to(self.home)):describe(changes)
+                                             for p,changes in journal_changes.items()}
                 atomic_write(self.store.root/manifest['id']/'manifest.json',
                              json.dumps(manifest,ensure_ascii=False).encode())
             return manifest
@@ -319,6 +324,7 @@ class Switcher:
         plans={}
         scanned=set()
         skipped=[]
+        identifiers={}
         for category in ['sessions','archived_sessions']:
             base=self.home/category
             if base.is_symlink():raise ValueError('会话目录不能是符号链接')
@@ -331,6 +337,7 @@ class Switcher:
                 ident=payload.get('id',payload.get('session_id'))
                 if header.get('type')!='session_meta' or ident not in selected:continue
                 scanned.add(ident)
+                identifiers[path]=ident
                 try:changes=plan_repairs(path)
                 except ValueError as exc:
                     if strict:raise
@@ -342,21 +349,19 @@ class Switcher:
             with path.open('rb') as stream:payload=json.loads(stream.readline())['payload']
             if payload.get('id',payload.get('session_id')) in blocked:del plans[path]
         missing=selected-scanned
-        stats={'scanned':len(scanned),'threads':len(plans),
+        stats={'scanned':len(scanned),'threads':len({identifiers[p] for p in plans}),
                'records':sum(len(v) for v in plans.values()),'unavailable':len(missing),'skipped':skipped}
         return plans,stats
 
     def compatibility_restore(self,manifest):
         plans={}
-        for name,spans in manifest.get('compatibility',{}).items():
-            relative=Path(name)
-            if relative.is_absolute() or '..' in relative.parts or relative.parts[0] not in ('sessions','archived_sessions'):
-                raise ValueError('修复备份路径越界')
-            path=self.home/relative
-            if path.is_symlink() or not path.resolve().is_relative_to(self.home):
-                raise ValueError('修复会话路径越界')
-            if not path.is_file():raise ValueError('待恢复的修复会话文件已不在原位置')
-            changes=restore_changes(path,self.store.content(manifest['id'],name),spans)
+        spans_by_file=manifest.get('file_changes',manifest.get('compatibility',{}))
+        if not spans_by_file:return plans
+        index=self.session_index()
+        for name,spans in spans_by_file.items():
+            original=self.store.content(manifest['id'],name)
+            path,_=self.locate_session(name,original,index)
+            changes=restore_changes(path,original,spans)
             if changes:plans[path]=changes
         return plans
 
@@ -373,16 +378,50 @@ class Switcher:
             raise ValueError('修复会话路径越界')
         return path
 
+    def session_index(self):
+        index={}
+        for category in ('sessions','archived_sessions'):
+            base=self.home/category
+            if base.is_symlink():raise ValueError('会话目录不能是符号链接')
+            if not base.exists():continue
+            for path in base.rglob('*.jsonl'):
+                self._session_path(str(path.relative_to(self.home)))
+                with path.open('rb') as stream:header=json.loads(stream.readline())
+                if header.get('type')!='session_meta':continue
+                payload=header.get('payload',{})
+                ident=payload.get('id',payload.get('session_id'))
+                if isinstance(ident,str):index.setdefault(ident,[]).append(path)
+        return index
+
+    def locate_session(self,name,original,index):
+        expected=self._session_path(name)
+        header=json.loads(original.split(b'\n',1)[0])
+        payload=header.get('payload',{})
+        ident=payload.get('id',payload.get('session_id'))
+        if header.get('type')!='session_meta' or not isinstance(ident,str):
+            raise ValueError('修复备份缺少有效会话 ID')
+        candidates=index.get(ident,[])
+        if expected in candidates:return expected,ident
+        same_name=[p for p in candidates if p.name==expected.name]
+        if len(same_name)==1:return same_name[0],ident
+        if len(candidates)==1:return candidates[0],ident
+        if not candidates:raise ValueError('找不到会话 '+ident+' 的本机文件，原始备份继续保留')
+        raise ValueError('会话 '+ident+' 存在多个候选文件，无法确认原位置；原始备份继续保留')
+
     def repair_backups(self):
         """Backups still holding original reasoning for currently repaired files."""
         protected=[]
-        for manifest in self.repair_manifests():
+        manifests=self.repair_manifests()
+        if not manifests:return protected
+        try:index=self.session_index()
+        except (ValueError,OSError):return [m['id'] for m in manifests]
+        for manifest in manifests:
             needed=False
             for name,spans in manifest['compatibility'].items():
-                path=self._session_path(name)
-                if not path.is_file():continue
                 try:
-                    if restore_changes(path,self.store.content(manifest['id'],name),spans):
+                    original=self.store.content(manifest['id'],name)
+                    path,_=self.locate_session(name,original,index)
+                    if restore_changes(path,original,spans):
                         needed=True;break
                 except (ValueError,OSError):
                     # Uncertainty must not let cleanup delete the only original copy.
@@ -390,27 +429,43 @@ class Switcher:
             if needed:protected.append(manifest['id'])
         return protected
 
-    def compatibility_restore_all(self):
-        """Reverse the newest matching repair for each file, preserving later appends."""
+    def compatibility_restore_all(self,selected=None):
+        """Merge repair batches by range, newest first; refuse ambiguous changes."""
         plans={}
-        handled=set()
+        covered={}
+        identifiers={}
+        blocked=set()
         stats={'threads':0,'records':0,'skipped':[]}
-        for manifest in self.repair_manifests():
+        manifests=self.repair_manifests()
+        if not manifests:return plans,stats
+        index=self.session_index()
+        for manifest in manifests:
             for name,spans in manifest['compatibility'].items():
-                path=self._session_path(name)
-                if path in handled or not path.is_file():continue
-                handled.add(path)
+                original=self.store.content(manifest['id'],name)
+                header=json.loads(original.split(b'\n',1)[0])
+                payload=header.get('payload',{})
+                ident=payload.get('id',payload.get('session_id',''))
+                if ident in blocked or (selected is not None and ident not in selected):continue
                 try:
-                    changes=restore_changes(path,self.store.content(manifest['id'],name),spans)
-                except ValueError as exc:
-                    with path.open('rb') as stream:
-                        payload=json.loads(stream.readline()).get('payload',{})
-                    stats['skipped'].append({'id':payload.get('id',payload.get('session_id','')), 'file':path.name,'reason':str(exc)})
-                    continue
-                if changes:
-                    plans[path]=changes
-                    stats['threads']+=1
-                    stats['records']+=len(changes)
+                    path,ident=self.locate_session(name,original,index)
+                    identifiers[path]=ident
+                    seen=covered.setdefault(path,set())
+                    for span in spans:
+                        key=(span['offset'],span['length'])
+                        if key in seen:continue
+                        changes=restore_changes(path,original,[span])
+                        start,length=key
+                        if any(start < other+size and other < start+length for other,size in seen):
+                            raise ValueError('不同修复批次的范围重叠，已保留会话原状和备份')
+                        seen.add(key)
+                        if changes:plans.setdefault(path,[]).extend(changes)
+                except (ValueError,OSError) as exc:
+                    blocked.add(ident)
+                    stats['skipped'].append({'id':ident,'file':Path(name).name,'reason':str(exc)})
+        plans={path:sorted(changes,key=lambda c:c.offset) for path,changes in plans.items()
+               if identifiers[path] not in blocked}
+        stats['threads']=len({identifiers[path] for path in plans})
+        stats['records']=sum(len(changes) for changes in plans.values())
         return plans,stats
 
     def _apply(self,text,routes,backup_id,updates,recovery_id=None,compatibility=None):
@@ -488,13 +543,14 @@ class Switcher:
             if provider=='openai':
                 compatibility,stats=self.compatibility_updates(updated,strict=False)
             else:
-                compatibility,stats=self.compatibility_restore_all()
+                compatibility,stats=self.compatibility_restore_all({r['id'] for r in updated})
             blocked={s['id'] for s in stats['skipped']}
             updated=[r for r in updated if r['id'] not in blocked]
             updates=self.header_updates(updated)
-            # Only a repair snapshot records spans to reverse on a later restore.
-            # A switch back to DeepSeek has already restored them in this operation.
-            snapshot=self.snapshot(compatibility if provider=='openai' else None)
+            # Both directions need an operation journal; only GPT repairs need
+            # long-term protection of original DeepSeek reasoning.
+            snapshot=self.snapshot(compatibility if provider=='openai' else None,
+                                   file_changes=compatibility)
             self._apply(text,updated,snapshot['id'],updates,compatibility=compatibility)
             removed=self._cleanup() if self.settings()['auto_cleanup'] else []
             if provider=='openai':
@@ -526,13 +582,13 @@ class Switcher:
                       else provider_auth_config(text))
             updates=self.header_updates(routes)
             repair_manifest=original
-            if not original.get('compatibility') and self.pending.exists():
+            if not original.get('file_changes') and not original.get('compatibility') and self.pending.exists():
                 pending=json.loads(self.pending.read_text())
                 if pending.get('compatibility_backup_id'):
                     repair_manifest=self.store.verify(pending['compatibility_backup_id'])
             compatibility=self.compatibility_restore(repair_manifest)
             # New threads and all message history are deliberately left in place.
-            safety=self.snapshot()
+            safety=self.snapshot(file_changes=compatibility)
             self._apply(text,routes,safety['id'],updates,recovery_id=ident,compatibility=compatibility)
             removed=self._cleanup() if self.settings()['auto_cleanup'] else []
             return {'restored':ident,'backup_id':safety['id'],'removed':len(removed),
@@ -695,10 +751,16 @@ class Switcher:
         keychain_key=self.keychain.get()
         key_configured=bool(keychain_key or config_key)
         key_storage='keychain' if keychain_key else ('config' if config_key else 'none')
+        try:
+            eligible=migration_providers(config)
+            _,preview=self.compatibility_restore_all({t['id'] for t in threads if t['model_provider'] in eligible})
+        except (ValueError,OSError):
+            preview={'threads':0,'records':0,'skipped':[],
+                     'error':'无法读取还原计划，切换前将重新检查备份；不会自动覆盖会话。'}
         return {'provider':'deepseek' if provider=='ds_api' else provider,'model':config.get('model','默认'),
                 'effort':config.get('model_reasoning_effort','默认'),'threads':threads,
                 'backups':[{'id':s['id'],'created_at':s['created_at'],'files':len(s['files'])} for s in snapshots],
                 'settings':self.settings(),'desktop_running':state=='running','desktop_check':state,
                 'pending':json.loads(self.pending.read_text()) if self.pending.exists() else None,
                 'backup_path':str(self.store.root),
-                'key_configured':key_configured,'key_storage':key_storage}
+                'key_configured':key_configured,'key_storage':key_storage,'deepseek_restore':preview}
