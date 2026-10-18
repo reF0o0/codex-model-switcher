@@ -34,7 +34,7 @@
 
 退出 ChatGPT，在切换页选择 DeepSeek 与 `deepseek-flash`（或 `deepseek-v4-pro`），点击「备份并切换全部会话」。默认复用你已配置的 DeepSeek API key；ChatGPT 登录凭据不变。以后换回 GPT 也一样。
 
-本版仅新增 DeepSeek → GPT 的格式修复。已修复会话再切回 DeepSeek 的兼容处理留待后续版本，当前不保证这些会话能在 DeepSeek 直接续聊。
+切回 DeepSeek 时会自动还原之前修复过的原始推理记录；修复位置被其他操作改过时跳过并保留现状。仍包含原始记录的修复备份不会被自动清理，直到完成还原。
 
 DeepSeek 使用自己的 API 余额；GPT 使用你当前 ChatGPT 登录对应的可用额度。工具不经过第三方中转。可见会话内容只有在你发起续聊/兼容接续时，才会发送给所选模型服务商。
 

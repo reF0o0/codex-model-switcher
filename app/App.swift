@@ -107,9 +107,14 @@ final class AppModel: ObservableObject {
                     else if let n = result["removed"] as? Int {message = "已清理 \(n) 份过期备份。"}
                     else {message = "设置已保存。"}
                     if let stats = result["compatibility"] as? [String:Any] {
-                        var lines = ["检查 \(stats["scanned"] as? Int ?? 0) 个本机会话；修复 \(stats["threads"] as? Int ?? 0) 个会话、\(stats["records"] as? Int ?? 0) 条推理记录。"]
-                        let unavailable = stats["unavailable"] as? Int ?? 0
-                        if unavailable > 0 {lines.append("\(unavailable) 个会话未找到本机文件，未检查历史格式。")}
+                        var lines: [String]
+                        if result["provider"] as? String == "deepseek" {
+                            lines = ["还原 \(stats["threads"] as? Int ?? 0) 个会话、\(stats["records"] as? Int ?? 0) 条原始推理记录。"]
+                        } else {
+                            lines = ["检查 \(stats["scanned"] as? Int ?? 0) 个本机会话；修复 \(stats["threads"] as? Int ?? 0) 个会话、\(stats["records"] as? Int ?? 0) 条推理记录。"]
+                            let unavailable = stats["unavailable"] as? Int ?? 0
+                            if unavailable > 0 {lines.append("\(unavailable) 个会话未找到本机文件，未检查历史格式。")}
+                        }
                         for skipped in stats["skipped"] as? [[String:String]] ?? [] {
                             lines.append("跳过 \(skipped["id"] ?? "")：\(skipped["reason"] ?? "未知格式")")
                         }
@@ -205,7 +210,7 @@ struct ContentView: View {
         .confirmationDialog("切换全部 GPT／DeepSeek 会话到 \(app.model)？",isPresented:$app.confirmSwitch,titleVisibility:.visible) {
             Button("备份并切换") {app.run("switch",["provider":app.provider,"model":app.model,"effort":app.effort])}
             Button("取消",role:.cancel) {}
-        } message: {Text(app.provider == "openai" ? "先备份，再切换并自动修复已验证的 DeepSeek 推理格式。未知格式会话跳过并保留原路由，完成后查看处理明细。先退出 ChatGPT。" : "保留会话 ID、消息、项目和归档状态。本版尚未处理修复后的推理记录切回 DeepSeek 的兼容问题。先退出 ChatGPT。")}
+        } message: {Text(app.provider == "openai" ? "先备份，再切换并自动修复已验证的 DeepSeek 推理格式。未知格式会话跳过并保留原路由，完成后查看处理明细。先退出 ChatGPT。" : "先备份，再切到 DeepSeek，并还原之前修复过的原始推理记录。修复位置被其他操作改动过的会话会跳过并保留现状。先退出 ChatGPT。")}
         .confirmationDialog("恢复选中的模型与服务商设置？",isPresented:$app.confirmRestore,titleVisibility:.visible) {
             Button("创建安全备份并恢复") {if let id=app.restoreID {app.run("restore",["id":id])}}
             Button("取消",role:.cancel) {}

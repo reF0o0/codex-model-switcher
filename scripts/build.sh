@@ -27,6 +27,7 @@ if [[ -d "$task_app" ]]; then
 fi
 /usr/bin/ditto --norsrc --noextattr "$task_build_app" "$task_app"
 /usr/bin/ditto -c -k --norsrc --noextattr --keepParent "$task_build_app" "$task_root/dist/codex-model-switcher-macos-arm64.zip"
+/usr/bin/xattr -cr "$task_app"
 /usr/bin/codesign --verify --deep "$task_app"
 # The recursive cleanup target is only the validated directory from mktemp above.
 if [[ "$task_staging" == /private/tmp/codex-provider-switcher.* ]]; then

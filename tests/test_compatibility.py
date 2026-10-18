@@ -212,3 +212,52 @@ class CompatibilityTests(CodexHomeFixture):
         with patch('switcher.core.desktop_state', side_effect=['stopped', 'unknown']):
             with self.assertRaises(ValueError):self.app.switch('openai', 'gpt-6.1-sol')
         self.assertEqual(self.path.read_bytes(), self.source)
+
+    def test_switching_back_to_deepseek_restores_original_reasoning(self):
+        repaired = self.app.switch('openai', 'gpt-6.1-sol')
+        self.assertNotEqual(self.path.read_bytes(), self.source)
+        self.assertIn(repaired['backup_id'], self.app.repair_backups())
+        result = self.app.switch('deepseek', 'deepseek-flash')
+        self.assertEqual(self.path.read_bytes().split(b'\n', 1)[1],
+                         self.source.split(b'\n', 1)[1])
+        self.assertEqual(result['compatibility_restore']['records'], 1)
+        self.assertEqual(self.app.repair_backups(), [])
+
+    def test_restore_on_switch_preserves_messages_appended_after_repair(self):
+        self.app.switch('openai', 'gpt-6.1-sol')
+        extra = line('event_msg', {'type': 'user_message', 'message': '新增消息'})
+        with self.path.open('ab') as stream:
+            stream.write(extra)
+        self.app.switch('deepseek', 'deepseek-flash')
+        self.assertEqual(self.path.read_bytes().split(b'\n', 1)[1],
+                         self.source.split(b'\n', 1)[1] + extra)
+
+    def test_restore_on_switch_skips_an_edited_span_and_keeps_going(self):
+        self.app.switch('openai', 'gpt-6.1-sol')
+        value = self.path.read_bytes().replace('保留推理备注'.encode(), '修改推理备注'.encode(), 1)
+        self.path.write_bytes(value)
+        result = self.app.switch('deepseek', 'deepseek-flash')
+        self.assertEqual(result['compatibility_restore']['records'], 0)
+        self.assertEqual(result['compatibility_restore']['skipped'][0]['id'], 'a')
+        self.assertEqual(self.path.read_bytes(), value)
+
+    def test_repeated_gpt_deepseek_roundtrip_is_byte_stable(self):
+        self.app.switch('openai', 'gpt-6.1-sol')
+        self.app.switch('deepseek', 'deepseek-flash')
+        once = self.path.read_bytes().split(b'\n', 1)[1]
+        self.app.switch('openai', 'gpt-6.1-sol')
+        self.app.switch('deepseek', 'deepseek-flash')
+        self.assertEqual(self.path.read_bytes().split(b'\n', 1)[1], once)
+        self.assertEqual(once, self.source.split(b'\n', 1)[1])
+
+    def test_cleanup_keeps_repair_backup_until_reasoning_is_restored(self):
+        repaired = self.app.switch('openai', 'gpt-6.1-sol')
+        self.app.save_settings(3, 3650, True)
+        for _ in range(5):
+            self.app.backup()
+        ids = {m['id'] for m in self.app.store.list()}
+        self.assertIn(repaired['backup_id'], ids)
+        self.app.switch('deepseek', 'deepseek-flash')
+        self.app._cleanup()
+        ids = {m['id'] for m in self.app.store.list()}
+        self.assertNotIn(repaired['backup_id'], ids)

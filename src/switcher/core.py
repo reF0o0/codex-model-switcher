@@ -286,6 +286,7 @@ class Switcher:
         if self.pending.exists():
             journal=json.loads(self.pending.read_text())
             protected=[journal[k] for k in ['backup_id','safety_backup_id','compatibility_backup_id'] if k in journal]
+        protected+=self.repair_backups()
         return self.store.prune(settings['keep'],settings['days'],protected=protected)
 
     def backup(self):
@@ -359,6 +360,59 @@ class Switcher:
             if changes:plans[path]=changes
         return plans
 
+    def repair_manifests(self):
+        return [s for s in self.store.list() if s.get('compatibility')]
+
+    def _session_path(self,name):
+        relative=Path(name)
+        if (relative.is_absolute() or '..' in relative.parts
+                or not relative.parts or relative.parts[0] not in ('sessions','archived_sessions')):
+            raise ValueError('修复备份路径越界')
+        path=self.home/relative
+        if path.is_symlink() or not path.resolve().is_relative_to(self.home):
+            raise ValueError('修复会话路径越界')
+        return path
+
+    def repair_backups(self):
+        """Backups still holding original reasoning for currently repaired files."""
+        protected=[]
+        for manifest in self.repair_manifests():
+            needed=False
+            for name,spans in manifest['compatibility'].items():
+                path=self._session_path(name)
+                if not path.is_file():continue
+                try:
+                    if restore_changes(path,self.store.content(manifest['id'],name),spans):
+                        needed=True;break
+                except (ValueError,OSError):
+                    # Uncertainty must not let cleanup delete the only original copy.
+                    needed=True;break
+            if needed:protected.append(manifest['id'])
+        return protected
+
+    def compatibility_restore_all(self):
+        """Reverse the newest matching repair for each file, preserving later appends."""
+        plans={}
+        handled=set()
+        stats={'threads':0,'records':0,'skipped':[]}
+        for manifest in self.repair_manifests():
+            for name,spans in manifest['compatibility'].items():
+                path=self._session_path(name)
+                if path in handled or not path.is_file():continue
+                handled.add(path)
+                try:
+                    changes=restore_changes(path,self.store.content(manifest['id'],name),spans)
+                except ValueError as exc:
+                    with path.open('rb') as stream:
+                        payload=json.loads(stream.readline()).get('payload',{})
+                    stats['skipped'].append({'id':payload.get('id',payload.get('session_id','')), 'file':path.name,'reason':str(exc)})
+                    continue
+                if changes:
+                    plans[path]=changes
+                    stats['threads']+=1
+                    stats['records']+=len(changes)
+        return plans,stats
+
     def _apply(self,text,routes,backup_id,updates,recovery_id=None,compatibility=None):
         if self.require_closed and desktop_state()!='stopped':
             raise ValueError('备份后无法确认 Codex 已退出，已停止写入。请退出并重试。')
@@ -431,19 +485,29 @@ class Switcher:
             # Other custom providers remain untouched; only the user's GPT/DeepSeek groups migrate.
             affected=[r for r in routes if r['model_provider'] in migration_providers(cfg)]
             updated=[{**r,'model_provider':stored_provider,'model':model,'reasoning_effort':effort} for r in affected]
-            compatibility,stats=(self.compatibility_updates(updated,strict=False) if provider=='openai'
-                                 else ({},{'scanned':0,'threads':0,'records':0,'unavailable':0,'skipped':[]}))
+            if provider=='openai':
+                compatibility,stats=self.compatibility_updates(updated,strict=False)
+            else:
+                compatibility,stats=self.compatibility_restore_all()
             blocked={s['id'] for s in stats['skipped']}
             updated=[r for r in updated if r['id'] not in blocked]
             updates=self.header_updates(updated)
-            snapshot=self.snapshot(compatibility)
+            # Only a repair snapshot records spans to reverse on a later restore.
+            # A switch back to DeepSeek has already restored them in this operation.
+            snapshot=self.snapshot(compatibility if provider=='openai' else None)
             self._apply(text,updated,snapshot['id'],updates,compatibility=compatibility)
             removed=self._cleanup() if self.settings()['auto_cleanup'] else []
+            if provider=='openai':
+                detail=('自动修复 '+str(stats['threads'])+' 个会话、'+str(stats['records'])+' 条推理记录。'+
+                        (('已跳过 '+str(len(blocked))+' 个未知格式会话（见处理明细），原文件和路由保留。') if blocked else '')+
+                        (('另有 '+str(stats.get('unavailable',0))+' 个会话未找到本机文件，未检查格式。') if stats.get('unavailable') else ''))
+            else:
+                detail=('已还原 '+str(stats['threads'])+' 个会话、'+str(stats['records'])+' 条原始推理记录。'+
+                        (('有 '+str(len(stats['skipped']))+' 个会话的修复位置已被修改，未覆盖（见处理明细）。') if stats['skipped'] else ''))
             return {'backup_id':snapshot['id'],'migrated':len(updated),'removed':len(removed),
                     'provider':provider,'model':model,'compatibility':stats,
-                    'message':'已切换 '+str(len(updated))+' 个会话；自动修复 '+str(stats['threads'])+' 个会话、'+str(stats['records'])+' 条推理记录。'+
-                    (('已跳过 '+str(len(blocked))+' 个未知格式会话（见处理明细），原文件和路由保留。') if blocked else '')+
-                    (('另有 '+str(stats['unavailable'])+' 个会话未找到本机文件，未检查格式。') if stats['unavailable'] else '')+'现在可以打开 ChatGPT。'}
+                    'compatibility_restore':stats,
+                    'message':'已切换 '+str(len(updated))+' 个会话；'+detail+'现在可以打开 ChatGPT。'}
 
     def restore(self,ident):
         with self.lock(allow_pending=True):
