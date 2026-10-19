@@ -36,12 +36,32 @@ class SearchControlTests(CodexHomeFixture):
         self.app.set_web_search(False)
         self.assertEqual(self.config()['web_search'],'disabled')
 
-    def test_flash_cannot_enable_but_can_disable_existing_live_config(self):
-        before=(self.home/'config.toml').read_bytes()
-        with self.assertRaisesRegex(ValueError,'Pro'):
-            self.app.set_web_search(True)
-        self.assertEqual((self.home/'config.toml').read_bytes(),before)
-        self.assertEqual(self.app.store.list(),[])
+    def test_flash_declared_search_support_can_be_enabled(self):
+        self.configure(model='deepseek-flash')
+        catalog=json.loads((self.home/'models.json').read_text())
+        next(m for m in catalog['models'] if m['slug']=='deepseek-flash').update(
+            supports_search_tool=True,web_search_tool_type='text')
+        (self.home/'models.json').write_text(json.dumps(catalog))
+        status=self.app.runtime_status()['web_search']
+        self.assertTrue(status['supported'])
+        self.assertTrue(status['can_enable'])
+        self.app.set_web_search(True)
+        self.assertEqual(self.config()['web_search'],'live')
+        self.assertEqual(self.app.runtime_status()['web_search']['state'],'on')
+
+    def test_flash_missing_catalog_declaration_is_repaired_for_that_model(self):
+        self.configure(model='deepseek-flash')
+        catalog=json.loads((self.home/'models.json').read_text())
+        next(m for m in catalog['models'] if m['slug']=='deepseek-flash').update(
+            supports_search_tool=False)
+        (self.home/'models.json').write_text(json.dumps(catalog))
+        self.app.set_web_search(True)
+        self.assertEqual(self.config()['web_search'],'live')
+        flash=next(m for m in json.loads((self.home/'models.json').read_text())['models']
+                   if m['slug']=='deepseek-flash')
+        self.assertTrue(flash['supports_search_tool'])
+
+    def test_existing_live_flash_config_can_be_disabled(self):
         self.configure(model='deepseek-flash',mode='live')
         self.app.set_web_search(False)
         self.assertEqual(self.config()['web_search'],'disabled')
@@ -133,13 +153,13 @@ class SearchControlTests(CodexHomeFixture):
         self.assertTrue(status['web_search']['requires_restart'])
         self.assertNotIn('test-secret',json.dumps(status))
 
-    def test_status_tracks_external_changes_and_unsupported_flash(self):
+    def test_status_tracks_external_changes_and_catalog_support_without_hardcoded_model(self):
         self.configure(mode='live')
         self.assertEqual(self.app.runtime_status()['web_search']['state'],'on')
         self.configure(model='deepseek-flash',mode='live')
         status=self.app.runtime_status()
-        self.assertEqual(status['web_search']['state'],'unsupported')
-        self.assertFalse(status['web_search']['can_enable'])
+        self.assertEqual(status['web_search']['state'],'catalog')
+        self.assertTrue(status['web_search']['can_enable'])
         self.assertTrue(status['web_search']['can_disable'])
         self.configure(provider='openai',model='gpt-6.1-sol')
         self.assertEqual(self.app.runtime_status()['provider'],'openai')
@@ -161,22 +181,17 @@ class SearchControlTests(CodexHomeFixture):
         self.app.switch('deepseek','deepseek-v4-pro')
         self.assertEqual(self.app.runtime_status()['provider'],'deepseek')
 
-    def test_enable_fixes_disabled_catalog_and_restore_keeps_other_catalog_edits(self):
+    def test_disabled_catalog_is_repaired_only_for_the_current_model(self):
         self.configure(mode='live')
         catalog=json.loads((self.home/'models.json').read_text())
         pro=next(m for m in catalog['models'] if m['slug']=='deepseek-v4-pro')
         pro['supports_search_tool']=False
         (self.home/'models.json').write_text(json.dumps(catalog))
         self.assertEqual(self.app.runtime_status()['web_search']['state'],'catalog')
-        result=self.app.set_web_search(True)
-        self.assertEqual(self.app.runtime_status()['web_search']['state'],'on')
-        catalog=json.loads((self.home/'models.json').read_text())
-        catalog['models'][0]['description']='new description after backup'
-        (self.home/'models.json').write_text(json.dumps(catalog))
-        self.app.restore(result['backup_id'])
-        restored=json.loads((self.home/'models.json').read_text())
-        self.assertFalse(next(m for m in restored['models'] if m['slug']=='deepseek-v4-pro')['supports_search_tool'])
-        self.assertEqual(restored['models'][0]['description'],'new description after backup')
+        self.app.set_web_search(True)
+        updated=json.loads((self.home/'models.json').read_text())
+        self.assertTrue(next(m for m in updated['models'] if m['slug']=='deepseek-v4-pro')['supports_search_tool'])
+        self.assertNotIn('supports_search_tool',next(m for m in updated['models'] if m['slug']=='deepseek-flash'))
 
     def test_unreadable_catalog_does_not_claim_search_on(self):
         self.configure(mode='live')

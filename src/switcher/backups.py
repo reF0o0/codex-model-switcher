@@ -37,6 +37,20 @@ def atomic_write(path, content):
 
 
 class BackupStore:
+    @classmethod
+    def existing(cls, root):
+        """Open an owned store for inspection without creating or changing files."""
+        root = Path(root)
+        marker = root / '.owner'
+        blobs = root / 'blobs'
+        if any(p.is_symlink() for p in (root.parent, root, marker, blobs)):
+            raise ValueError('备份目录不能是符号链接')
+        if not root.is_dir() or not blobs.is_dir() or marker.read_text() != OWNER:
+            raise ValueError('未找到本工具的有效备份目录')
+        store = cls.__new__(cls)
+        store.root, store.blobs = root, blobs
+        return store
+
     def __init__(self, root):
         root = Path(root)
         if root.is_symlink() or root.parent.is_symlink():

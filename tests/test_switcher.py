@@ -84,6 +84,28 @@ class SwitchTests(CodexHomeFixture):
         self.assertEqual(config['model_provider'],'ds_api')
         self.assertFalse(config['model_providers']['ds_api']['requires_openai_auth'])
 
+    def test_default_switch_only_migrates_recent_30_days(self):
+        import time
+        with db_connection(self.home/'state_5.sqlite') as db:
+            db.execute('alter table threads add column updated_at_ms integer')
+            now=int(time.time()*1000)
+            db.execute("update threads set updated_at_ms=? where id='a'",(now,))
+            db.execute("update threads set updated_at_ms=? where id='b'",(now-31*86400*1000,))
+        result=self.app.switch('openai','gpt-6.1-sol')
+        rows={r[0]:r[1:] for r in self.rows()}
+        self.assertEqual(rows['a'][0],'openai')
+        self.assertEqual(rows['b'][0],'custom')
+        self.assertEqual(result['scope_days'],30)
+        self.assertEqual(result['migrated'],1)
+        status=self.app.status()
+        self.assertTrue(next(t for t in status['threads'] if t['id']=='a')['activity_ms'])
+
+    def test_switch_days_is_validated_without_touching_config(self):
+        before=(self.home/'config.toml').read_bytes()
+        for value in (0,366,1.5):
+            with self.assertRaises(ValueError):self.app.switch('openai','gpt-6.1-sol',days=value)
+        self.assertEqual((self.home/'config.toml').read_bytes(),before)
+
     def test_restore_keeps_new_threads_and_new_messages(self):
         result=self.app.switch('openai','gpt-6.1-sol','high')
         (self.home/'sessions'/'one.jsonl').write_bytes(self.original+b'new message\n')

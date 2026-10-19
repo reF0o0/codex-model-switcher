@@ -5,6 +5,11 @@ from pathlib import Path
 import selectors
 import subprocess
 import time
+from collections import deque
+
+
+class RpcTimeoutError(TimeoutError):
+    """No event arrived before this receive call's deadline."""
 
 
 class Rpc:
@@ -20,6 +25,7 @@ class Rpc:
         self.selector.register(self.process.stdout,selectors.EVENT_READ)
         self.buffer=b''
         self.ident=0
+        self.events=deque()
         try:
             self.call('initialize',{'clientInfo':{'name':'codex-provider-switcher','version':'1.0'},
                                     'capabilities':{'experimentalApi':True}})
@@ -32,6 +38,10 @@ class Rpc:
         self.process.stdin.flush()
 
     def receive(self,timeout=45):
+        if self.events:return self.events.popleft()
+        return self._receive(timeout)
+
+    def _receive(self,timeout=45):
         deadline=time.monotonic()+timeout
         while time.monotonic()<deadline:
             if b'\n' in self.buffer:
@@ -41,20 +51,21 @@ class Rpc:
                 chunk=os.read(self.process.stdout.fileno(),65536)
                 if not chunk:raise ValueError('Codex 后端已退出')
                 self.buffer+=chunk
-        raise ValueError('等待 Codex 后端超时；原会话保留')
+        raise RpcTimeoutError('等待 Codex 后端超时；原会话保留')
 
     def call(self,method,params):
         self.ident+=1
         self.send({'id':self.ident,'method':method,'params':params})
         deadline=time.monotonic()+45
         while time.monotonic()<deadline:
-            data=self.receive(max(1,deadline-time.monotonic()))
+            data=self._receive(max(1,deadline-time.monotonic()))
             if data.get('id')==self.ident:
                 if 'error' in data:
                     err=ValueError('Codex 会话接口拒绝操作（'+str(data['error'].get('code'))+'）；原会话保留')
                     err.rpc_error=data['error']
                     raise err
                 return data['result']
+            if 'method' in data and 'id' not in data:self.events.append(data)
         raise ValueError('Codex 接口超时')
 
     def close(self):
