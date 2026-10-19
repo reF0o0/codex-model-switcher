@@ -672,8 +672,55 @@ final class AppModel: ObservableObject {
     }
 }
 
+struct TermsView: View {
+    let onAccept: () -> Void
+    let onDecline: () -> Void
+
+    private var termsText: String {
+        if let url = Bundle.main.url(forResource:"TERMS",withExtension:"md"),
+           let text = try? String(contentsOf:url,encoding:.utf8) {
+            return text
+        }
+        return "本工具会读取并可能修改本机 ~/.codex 下的配置、会话和数据库。\n\n" +
+            "请先保存工作并完全退出 ChatGPT/Codex。工具会尽力备份，但不保证恢复所有数据。\n\n" +
+            "GPT、ChatGPT、Codex 和 DeepSeek 的使用受各自服务条款、额度和隐私政策约束。\n\n" +
+            "本软件按现状提供，不承诺无错误；使用风险由你自行承担。完整条款见仓库 TERMS.md。"
+    }
+
+    var body: some View {
+        VStack(alignment:.leading,spacing:14) {
+            HStack(spacing:8) {
+                Image(systemName:"doc.text")
+                Text("使用条款").font(.title2.bold())
+            }
+            ScrollView {
+                Text(termsText)
+                    .font(.callout)
+                    .textSelection(.enabled)
+                    .frame(maxWidth:.infinity,alignment:.leading)
+            }
+            .frame(width:600,height:360)
+            Text("点击“同意并继续”表示你已阅读并同意上述条款。不同意请退出应用。")
+                .font(.caption).foregroundStyle(.secondary)
+            HStack {
+                Button("退出") {onDecline()}
+                Spacer()
+                Button("同意并继续") {onAccept()}
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(24)
+        .frame(width:660)
+        .background(.regularMaterial,in:RoundedRectangle(cornerRadius:14))
+        .shadow(radius:24)
+        .interactiveDismissDisabled()
+    }
+}
+
 struct ContentView: View {
     @StateObject private var app = AppModel()
+    @AppStorage("terms-accepted-v1") private var termsAccepted = false
     var filtered: [ThreadRow] {
         (app.snapshot?.threads ?? []).filter {thread in
             (app.showArchived || thread.archived == 0) && (!app.onlyAttention || app.attention.contains(where: {$0.id == thread.id})) && (app.query.isEmpty || thread.title.localizedCaseInsensitiveContains(app.query) || thread.id.contains(app.query))
@@ -827,7 +874,19 @@ struct ContentView: View {
             }
         }
         .padding(24).frame(minWidth:840,minHeight:660)
-        .onAppear {app.run("startup")}
+        .overlay {
+            if !termsAccepted {
+                ZStack {
+                    Color.black.opacity(0.35).ignoresSafeArea()
+                    TermsView(onAccept:{termsAccepted=true},
+                              onDecline:{NSApplication.shared.terminate(nil)})
+                }
+            }
+        }
+        .onAppear {if termsAccepted {app.run("startup")}}
+        .onChange(of:termsAccepted) {_,accepted in
+            if accepted && !app.loaded {app.run("startup")}
+        }
         .alert("操作未完成",isPresented:Binding(get:{app.error != nil},set:{if !$0 {app.error=nil;app.errorNeedsPermission=false}})) {
             if app.errorNeedsPermission {
                 Button("申请目录访问…") {app.error=nil; app.errorNeedsPermission=false; app.requestFolderAccess()}

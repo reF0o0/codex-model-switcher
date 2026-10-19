@@ -1,6 +1,6 @@
 # Codex 模型切换器
 
-更新授权说明：本机 1.6.3 使用固定本地签名，更新时会校验同一身份并保留授权记录，减少版本更新后再次授权。见 [更新授权与一次性设置](docs/signing.md)。
+更新授权说明：本机 1.6.4 使用固定本地签名，更新时会校验同一身份并保留授权记录，减少版本更新后再次授权。见 [更新授权与一次性设置](docs/signing.md)。
 
 <img src="assets/AppIcon.png" width="128" alt="Codex 模型切换器图标">
 
@@ -35,7 +35,7 @@
 
 ## 安装
 
-1  从 [Releases 页面](https://github.com/reF0o0/codex-model-switcher/releases)下载当前版本的 `Codex-Model-Switcher-v1.6.3.zip`（或最新 Release 中的 zip）。
+1  从 [Releases 页面](https://github.com/reF0o0/codex-model-switcher/releases)下载当前版本的 `Codex-Model-Switcher-v1.6.4.zip`（或最新 Release 中的 zip）。
 
 2  解压，把「Codex 模型切换器.app」拖到「应用程序」文件夹，双击打开。
 
@@ -45,7 +45,7 @@
 
 目前提供 Apple Silicon 构建。Release 使用本机固定证书签名，尚未做 Apple 开发者签名和公证；Release 同时提供 SHA-256 校验文件。
 
-本机 1.6.3 使用固定本地证书签名，后续构建和安装沿用同一身份，减少更新后重新授权的问题；此证书只用于本人的这台 Mac，不作为公开分发方案。具体规则见 [更新授权与签名](docs/signing.md)。其他 Mac 首次打开时可能需要在“隐私与安全性”中手动允许。
+本机 1.6.4 使用固定本地证书签名，后续构建和安装沿用同一身份，减少更新后重新授权的问题；此证书只用于本人的这台 Mac，不作为公开分发方案。具体规则见 [更新授权与签名](docs/signing.md)。其他 Mac 首次打开时可能需要在“隐私与安全性”中手动允许。
 
 ## 使用
 
@@ -222,6 +222,10 @@ scripts/build.sh         编译、签名和打包
 docs/usage.md            详细使用说明
 docs/verification.md     实测范围与验证记录
 ```
+
+## 许可证与使用条款
+
+源代码采用 [MIT License](LICENSE)。预编译应用首次启动时会显示 [使用条款](TERMS.md)，必须点击“同意并继续”后才能读取或修改 Codex 数据；不同意可以退出应用。MIT License 管的是代码的使用、修改和再分发；`TERMS.md` 管的是预编译应用的运行和使用。
 
 ## 实测与已知限制
 
