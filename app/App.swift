@@ -787,6 +787,13 @@ struct ContentView: View {
                     }
                 }
 
+                HStack(spacing:8) {
+                    Button("DeepSeek 密钥设置",systemImage:"key") {app.showKeySheet=true}
+                    if app.snapshot?.key_configured == true {
+                        Label("已保存",systemImage:"checkmark.seal")
+                            .font(.caption).foregroundStyle(.green)
+                    }
+                }
                 DisclosureGroup("维护工具",isExpanded:$app.showAdvanced) {
                     VStack(alignment:.leading,spacing:12) {
                         Button("只修复路由",systemImage:"wrench.and.screwdriver") {app.confirmRepair=true}
@@ -796,8 +803,10 @@ struct ContentView: View {
                             if app.live?.provider == "deepseek" {app.confirmDeepSeekRepair=true}
                             else {app.confirmFormatRepair=true}
                         }.disabled(!app.canWrite || !["openai","deepseek"].contains(app.live?.provider ?? ""))
-                        Button("DeepSeek 密钥设置",systemImage:"key") {app.showKeySheet=true}
-                    }.padding(.top,8)
+                    }
+                    .frame(maxWidth:.infinity,alignment:.leading)
+                    .padding(.top,8)
+                    .padding(.leading,18)
                 }
             }.frame(maxWidth:.infinity,alignment:.leading).padding(20)
         }.disabled(app.busy)
