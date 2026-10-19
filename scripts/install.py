@@ -33,8 +33,13 @@ def install(archive, target, migrate_legacy=False):
         for row in processes:
             if len(row)!=3 or row[2]!=executable:continue
             pid=int(row[0])
-            if any(len(p)==3 and int(p[1])==pid for p in processes):
-                raise ValueError('切换器仍有操作在运行，未替换应用。')
+            deadline=time.monotonic()+5
+            while any(len(p)==3 and int(p[1])==pid for p in processes):
+                if time.monotonic()>=deadline:
+                    raise ValueError('切换器仍有操作在运行，未替换应用。请等当前操作结束后重试。')
+                time.sleep(0.2)
+                processes=[line.strip().split(None,2) for line in subprocess.check_output(
+                    ['ps','-axo','pid=,ppid=,comm='],text=True).splitlines()]
             os.kill(pid,signal.SIGTERM)
             for _ in range(60):
                 try:os.kill(pid,0)
@@ -65,6 +70,8 @@ if __name__=='__main__':
         repo=Path(__file__).resolve().parents[1]
         result=install(repo/'dist/codex-model-switcher-macos-arm64.zip',Path('/Applications/Codex 模型切换器.app'),args.migrate_legacy)
         print(json.dumps(result,ensure_ascii=False))
-    except (ValueError,OSError,subprocess.CalledProcessError):
-        print(json.dumps({'ok':False,'error':'安装未完成，现有应用已保留或恢复。请检查固定签名与操作状态；首次迁移请先阅读 docs/signing.md。'},ensure_ascii=False))
+    except (ValueError,OSError,subprocess.CalledProcessError) as exc:
+        detail=str(exc).strip()
+        print(json.dumps({'ok':False,'error':'安装未完成，现有应用已保留或恢复。请检查固定签名与操作状态；首次迁移请先阅读 docs/signing.md。'+
+                          ((' 原因：'+detail[:300]) if detail else '')},ensure_ascii=False))
         raise SystemExit(1)

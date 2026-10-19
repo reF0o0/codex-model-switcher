@@ -59,6 +59,15 @@ struct RecoveryModelChecks {
         try require(saved.count == 1, "damaged config was not retained")
         let retained = try Data(contentsOf:saved[0])
         try require(retained == damaged, "damaged config bytes changed")
-        print("Recovery AppModel checks: PASS (missing/invalid config, backup selection, client guard, file permission gate, restoration, retained damage, normal state)")
+
+        try Data("not a sqlite database\n".utf8).write(to:database)
+        app.run("status"); try wait {!app.busy}
+        try require(app.recovery?.databaseBad == true, "corrupt database did not enter recovery")
+        try require(app.databaseRestoreID != nil, "database recovery backup missing")
+        app.run("recover-database",["id":app.databaseRestoreID!]); try wait {!app.busy}
+        try require(app.error == nil && app.recovery == nil && app.canWrite,
+                    "database recovery did not restore normal state")
+        try require(app.snapshot?.threads.count == 2, "database recovery lost thread rows")
+        print("Recovery AppModel checks: PASS (missing/invalid config, backup selection, client guard, file permission gate, restoration, retained damage, database recovery, normal state)")
     }
 }

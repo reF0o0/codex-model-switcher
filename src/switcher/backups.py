@@ -131,26 +131,38 @@ class BackupStore:
         if folder.is_symlink() or path.is_symlink() or not path.is_file():
             raise ValueError('备份不是有效普通目录')
         manifest = json.loads(path.read_text())
+        if not isinstance(manifest, dict):
+            raise ValueError('备份清单格式无效')
         if (manifest.get('owner') != OWNER or manifest.get('version') != 1 or
                 manifest.get('id') != ident or manifest.get('complete') is not True):
             raise ValueError('备份清单无效')
+        files = manifest.get('files')
+        routes = manifest.get('routes', [])
+        if not isinstance(files, dict) or not isinstance(routes, list):
+            raise ValueError('备份清单内容格式无效')
+        if not isinstance(manifest.get('created_at'), str):
+            raise ValueError('备份时间格式无效')
         stamp = dt.datetime.fromisoformat(manifest['created_at'])
         if stamp.tzinfo is None:
             raise ValueError('备份时间缺少时区')
-        for name, digest in manifest['files'].items():
+        for name, digest in files.items():
+            if not isinstance(name, str) or not isinstance(digest, str):
+                raise ValueError('备份清单路径格式无效')
             if Path(name).is_absolute() or '..' in Path(name).parts:
                 raise ValueError('备份路径越界')
             self.blob_path(digest)
         return manifest
 
-    def list(self):
+    def list(self, errors=None):
         result = []
         for folder in self.root.iterdir():
             if folder.is_symlink() or not folder.is_dir() or not IDENT.fullmatch(folder.name):
                 continue
             try:
                 result.append(self.read(folder.name))
-            except (ValueError, OSError, KeyError, TypeError):
+            except (ValueError, OSError, KeyError, TypeError, AttributeError):
+                if errors is not None:
+                    errors.append(folder.name)
                 continue
         return sorted(result, key=lambda s: (s['created_at'], s['id']), reverse=True)
 

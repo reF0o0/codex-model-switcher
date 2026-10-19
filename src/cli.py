@@ -5,7 +5,7 @@ sys.dont_write_bytecode = True
 from switcher.core import Switcher
 from switcher.permissions import check_permissions, require_permissions, PermissionCheckError
 
-PAYLOAD_COMMANDS=['switch','restore','settings','save-key','bridge','diagnose','ignore-attention','repair-formats','repair-deepseek','web-search']
+PAYLOAD_COMMANDS=['switch','restore','recover-database','settings','save-key','bridge','diagnose','ignore-attention','repair-formats','repair-deepseek','web-search']
 
 
 def payload():
@@ -27,7 +27,7 @@ def require(data,name,what):
 def main():
     p=argparse.ArgumentParser()
     p.add_argument('--home')
-    p.add_argument('command',choices=['permissions','recovery-status','diagnose','status','startup','live-status','switch','backup','restore','cleanup','settings','save-key','bridge','ignore-attention','clear-attention-ignores','repair','repair-formats','repair-deepseek','web-search'])
+    p.add_argument('command',choices=['permissions','recovery-status','diagnose','status','startup','live-status','switch','backup','restore','recover-database','cleanup','settings','save-key','bridge','ignore-attention','clear-attention-ignores','repair','repair-formats','repair-deepseek','web-search'])
     args=p.parse_args()
     data=payload() if args.command in PAYLOAD_COMMANDS else {}
     # Permission reporting must work even when Switcher cannot create its data directory.
@@ -41,7 +41,7 @@ def main():
         from switcher.diagnostics import diagnose_thread
         print(json.dumps({'ok':True,'result':diagnose_thread(args.home,require(data,'id','会话 ID'))},ensure_ascii=False))
         return
-    if args.command!='live-status':require_permissions(args.home, allow_missing_config=args.command=='restore')
+    if args.command!='live-status':require_permissions(args.home, allow_missing_config=args.command in ('restore','recover-database'))
     app=Switcher(args.home)
     if args.command in ['status','startup']:
         if args.command=='startup' and app.settings()['auto_cleanup']:app.cleanup()
@@ -50,6 +50,7 @@ def main():
     elif args.command=='switch':result=app.switch(require(data,'provider','服务商'),require(data,'model','模型'),data.get('effort','high'),days=int(data.get('days',30)))
     elif args.command=='backup':result=app.backup()
     elif args.command=='restore':result=app.restore(require(data,'id','备份 ID'))
+    elif args.command=='recover-database':result=app.recover_database(require(data,'id','备份 ID'))
     elif args.command=='repair':result=app.repair()
     elif args.command=='repair-formats':result=app.repair_compatibility(data.get('id'))
     elif args.command=='repair-deepseek':result=app.repair_deepseek(data.get('id'))

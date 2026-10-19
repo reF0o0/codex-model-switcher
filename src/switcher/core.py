@@ -106,10 +106,10 @@ def configured_key(provider):
     return value if isinstance(value,str) and value.strip() and value not in ('removed','<stored-in-keychain>') else None
 
 
-def configuration_backups(store):
+def configuration_backups(store, errors=None):
     """Only offer snapshots with a verified, parseable configuration for restoration."""
     result=[]
-    for entry in store.list():
+    for entry in store.list(errors):
         try:tomllib.loads(store.content(entry['id'],'config.toml').decode())
         except (ValueError,OSError,KeyError,EOFError):continue
         result.append(entry)
@@ -127,6 +127,19 @@ def set_deepseek_key(text,key):
         body=[s for s in lines[start+1:end] if not re.match(r'^\s*experimental_bearer_token\s*=',s)]
         text=''.join(lines[:start+1])+'experimental_bearer_token='+json.dumps(key)+'\n'+''.join(body)+''.join(lines[end:])
     return provider_auth_config(text)
+
+
+def sqlite_database_ok(data):
+    """Validate a database blob without touching the live Codex directory."""
+    try:
+        with tempfile.NamedTemporaryFile(prefix='switcher-db-check-',suffix='.sqlite') as temp:
+            temp.write(data);temp.flush();os.fsync(temp.fileno())
+            with sqlite3.connect(Path(temp.name).as_uri()+'?mode=ro',uri=True,timeout=2,
+                                 factory=ManagedConnection) as db:
+                row=db.execute('pragma quick_check').fetchone()
+            return bool(row and row[0]=='ok')
+    except (OSError,sqlite3.Error):
+        return False
 
 
 def _process_lines():
@@ -218,6 +231,24 @@ def replace_header(path, header):
 
 class Switcher:
     @staticmethod
+    def database_state(home=None):
+        home=Path(home or Path.home()/'.codex').expanduser().absolute()
+        result={}
+        for name in ('state_5.sqlite','thread_history_1.sqlite'):
+            path=home/name
+            if path.is_symlink():state='symlink'
+            elif not path.exists():state='missing'
+            else:
+                try:
+                    with sqlite3.connect(path.as_uri()+'?mode=ro',uri=True,timeout=2,
+                                         factory=ManagedConnection) as db:
+                        row=db.execute('pragma quick_check').fetchone()
+                    state='ok' if row and row[0]=='ok' else 'invalid'
+                except (OSError,sqlite3.Error):state='invalid'
+            result[name]=state
+        return result
+
+    @staticmethod
     def recovery_status(home=None):
         home = Path(home or Path.home()/'.codex').expanduser().absolute()
         config = home/'config.toml'
@@ -229,13 +260,34 @@ class Switcher:
         except (ValueError, UnicodeError):state = 'invalid'
         except OSError:state = 'unreadable'
         backups = []
+        database_backups = []
+        errors = []
+        database_state = Switcher.database_state(home)
         root = home/'provider-switcher/backups'
         if root.exists() or root.is_symlink():
-            store = BackupStore.existing(root)
-            for entry in configuration_backups(store):
-                backups.append({'id':entry['id'], 'created_at':entry['created_at'], 'files':len(entry['files'])})
-        return {'config_state':state, 'backups':backups, 'desktop_check':desktop_state(),
-                'checked_at':time.time()}
+            try:store = BackupStore.existing(root)
+            except (ValueError,OSError):store = None
+            if store is not None:
+                entries = store.list(errors)
+                for entry in entries:
+                    try:tomllib.loads(store.content(entry['id'],'config.toml').decode())
+                    except (ValueError,OSError,KeyError,EOFError):pass
+                    else:backups.append({'id':entry['id'], 'created_at':entry['created_at'], 'files':len(entry['files'])})
+                database_bad=(database_state.get('state_5.sqlite') in ('invalid','missing') or
+                              database_state.get('thread_history_1.sqlite')=='invalid')
+                if database_bad:
+                    for entry in entries:
+                        for name in ('state_5.sqlite','thread_history_1.sqlite'):
+                            if name not in entry['files']:continue
+                            try:
+                                if sqlite_database_ok(store.content(entry['id'],name)):
+                                    database_backups.append({'id':entry['id'], 'created_at':entry['created_at'],
+                                                             'files':len(entry['files'])})
+                                    break
+                            except (ValueError,OSError,EOFError):continue
+        return {'config_state':state, 'backups':backups, 'database_state':database_state,
+                'database_backups':database_backups, 'unreadable_backups':len(errors),
+                'desktop_check':desktop_state(), 'checked_at':time.time()}
 
     def __init__(self, home=None, require_closed=True, keychain=None):
         self.home=Path(home or Path.home()/'.codex').expanduser().resolve()
@@ -253,12 +305,41 @@ class Switcher:
         self.search_file=self.data/'search-state.json'
         self.ignores_file=self.data/'attention-ignores.json'
 
-    def attention_ignores(self):
+    def _quarantine(self,path,warnings):
+        """Move a corrupt derived-state file aside so the main window can still load."""
+        folder=self.data/'quarantine'
+        try:
+            if folder.is_symlink():raise ValueError('工具状态隔离目录不能是符号链接')
+            folder.mkdir(mode=0o700,exist_ok=True)
+            folder.chmod(0o700)
+            target=folder/(path.name+'.'+str(int(time.time()))+'.'+uuid.uuid4().hex[:6])
+            shutil.move(str(path),str(target))
+            if warnings is not None:
+                warnings.append(path.name+' 无法解析，已移到 '+str(target.relative_to(self.home))+' 并使用默认值。')
+        except (OSError,ValueError):
+            if warnings is not None:
+                warnings.append(path.name+' 无法解析；未移动原文件，已使用默认值。')
+
+    def _tool_json(self,name,default,expected=None,warnings=None):
+        path=self.data/name
+        if path.is_symlink():raise ValueError(name+' 不能是符号链接')
+        if not path.exists():return default
+        try:
+            value=json.loads(path.read_text())
+        except (ValueError,UnicodeError):
+            self._quarantine(path,warnings)
+            return default
+        if value is None or (expected is not None and not isinstance(value,expected)):
+            self._quarantine(path,warnings)
+            return default
+        return value
+
+    def attention_ignores(self,warnings=None):
         path=self.ignores_file
-        if path.is_symlink():raise ValueError('忽略记录不能是符号链接')
-        value=json.loads(path.read_text()) if path.exists() else []
+        value=self._tool_json('attention-ignores.json',[],list,warnings)
         if not isinstance(value,list) or not all(isinstance(v,str) and v for v in value):
-            raise ValueError('忽略记录格式无效')
+            self._quarantine(path,warnings)
+            return []
         return sorted(set(value))
 
     def ignore_attention(self,ident):
@@ -276,10 +357,16 @@ class Switcher:
             sync_directory(self.data)
             return {'ignored_attention':[]}
 
-    def search_preferences(self):
+    def search_preferences(self,warnings=None,strict=False):
         if self.search_file.is_symlink():raise ValueError('联网偏好文件不能是符号链接')
-        value=json.loads(self.search_file.read_text()) if self.search_file.exists() else {}
-        return validate_search_preferences(value)
+        if strict:
+            value=json.loads(self.search_file.read_text()) if self.search_file.exists() else {}
+            return validate_search_preferences(value)
+        value=self._tool_json('search-state.json',{},dict,warnings)
+        try:return validate_search_preferences(value)
+        except ValueError:
+            self._quarantine(self.search_file,warnings)
+            return {}
 
     def search_catalog(self,config,original=None,model=None,force_default=False):
         """Read or restore the current model's two search capability fields."""
@@ -359,7 +446,7 @@ class Switcher:
             _,catalog=self.search_catalog(config) if enabled else (False,None)
             if config.get('web_search')==mode and catalog is None:
                 return {'message':'联网配置已经'+('开启' if enabled else '关闭')+'，无需修改。'}
-            preferences=self.search_preferences()
+            preferences=self.search_preferences(strict=True)
             preferences['deepseek']=mode
             text=rewrite_config(text,{'web_search':mode})
             snapshot=self.snapshot(manage_search_catalog=config.get('model') if catalog is not None else False)
@@ -369,9 +456,17 @@ class Switcher:
                     'message':'DeepSeek 官方内置搜索已'+('开启' if enabled else '关闭')+
                               '；重新打开 ChatGPT/Codex 后使用。此开关不控制 MCP、浏览器或其他联网工具。'}
 
-    def settings(self):
-        path=self.data/'settings.json'
-        return json.loads(path.read_text()) if path.exists() else {'keep':10,'days':30,'auto_cleanup':True}
+    def settings(self,warnings=None):
+        default={'keep':10,'days':30,'auto_cleanup':True}
+        value=self._tool_json('settings.json',default,dict,warnings)
+        valid=(isinstance(value.get('keep'),int) and not isinstance(value.get('keep'),bool)
+               and isinstance(value.get('days'),int) and not isinstance(value.get('days'),bool)
+               and isinstance(value.get('auto_cleanup'),bool)
+               and 3<=value['keep']<=100 and 1<=value['days']<=3650)
+        if not valid:
+            self._quarantine(self.data/'settings.json',warnings)
+            return default
+        return value
 
     def save_settings(self,keep,days,auto_cleanup=True):
         if not (3<=keep<=100 and 1<=days<=3650):raise ValueError('保留数量 3–100，天数 1–3650')
@@ -406,15 +501,20 @@ class Switcher:
 
     def routes(self):
         with self.connect(True) as con:
-            return [dict(r) for r in con.execute('select id,model_provider,model,reasoning_effort from threads')]
+            columns={r['name'] for r in con.execute('pragma table_info(threads)')}
+            fields=['id','model_provider','model','reasoning_effort']
+            if 'rollout_path' in columns:fields.append('rollout_path')
+            return [dict(r) for r in con.execute('select '+','.join(fields)+' from threads')]
 
     def switch_routes(self,days):
         with self.connect(True) as con:
             columns={r['name'] for r in con.execute('pragma table_info(threads)')}
             activities=[name for name in ('recency_at_ms','updated_at_ms','created_at_ms') if name in columns]
             activity=('coalesce('+','.join(activities)+',0)' if activities else '0')+' as activity_ms'
+            fields=['id','model_provider','model','reasoning_effort']
+            if 'rollout_path' in columns:fields.append('rollout_path')
             rows=[dict(r) for r in con.execute(
-                'select id,model_provider,model,reasoning_effort,'+activity+' from threads')]
+                'select '+','.join(fields)+','+activity+' from threads')]
         cutoff=(time.time()-days*86400)*1000
         # A missing timestamp predates this schema; retain it rather than silently losing an unknown session.
         return [r for r in rows if r['activity_ms'] is None or r['activity_ms']==0 or r['activity_ms']>=cutoff]
@@ -476,8 +576,10 @@ class Switcher:
         settings=self.settings()
         protected=[]
         if self.pending.exists():
-            journal=json.loads(self.pending.read_text())
-            protected=[journal[k] for k in ['backup_id','safety_backup_id','compatibility_backup_id'] if k in journal]
+            try:journal=json.loads(self.pending.read_text())
+            except (ValueError,UnicodeError):journal=None
+            if isinstance(journal,dict):
+                protected=[journal[k] for k in ['backup_id','safety_backup_id','compatibility_backup_id'] if k in journal]
         protected+=self.repair_backups()
         # Recovery safety snapshots may have no usable config. They must not
         # displace the last three actual configuration recovery points.
@@ -490,7 +592,21 @@ class Switcher:
             removed=self._cleanup() if self.settings()['auto_cleanup'] else []
             return {'backup_id':snapshot['id'],'removed':len(removed),'files':len(snapshot['files'])}
 
-    def header_updates(self,routes):
+    def _route_for_path(self,path,routes):
+        try:resolved=path.resolve()
+        except OSError:return None
+        for route in routes:
+            rollout=route.get('rollout_path')
+            if rollout:
+                try:
+                    if Path(rollout).expanduser().resolve()==resolved:return route
+                except OSError:pass
+            ident=route.get('id')
+            if isinstance(ident,str) and path.name.endswith('-'+ident+'.jsonl'):
+                return route
+        return None
+
+    def header_updates(self,routes,skipped=None,blocked=None):
         by_id={r['id']:r['model_provider'] for r in routes}
         updates=[]
         for category in ['sessions','archived_sessions']:
@@ -501,7 +617,16 @@ class Switcher:
                 if path.is_symlink() or not path.resolve().is_relative_to(base.resolve()):raise ValueError('会话路径越界')
                 with path.open('rb') as f:line=f.readline()
                 try:record=json.loads(line)
-                except (ValueError,UnicodeError):raise ValueError('会话文件头无法解析：'+path.name)
+                except (ValueError,UnicodeError):
+                    target=self._route_for_path(path,routes)
+                    detail='会话文件头无法解析：'+path.name+'；原文件未改动'
+                    if skipped is not None:
+                        skipped.append({'id':target['id'] if target else 'file:'+path.name,
+                                        'file':path.name,'reason':detail})
+                    if target is not None:
+                        if blocked is None:raise ValueError(detail)
+                        blocked.add(target['id'])
+                    continue
                 if record.get('type')!='session_meta':continue
                 payload=record['payload']
                 ident=payload.get('id',payload.get('session_id'))
@@ -522,8 +647,23 @@ class Switcher:
             for path in base.rglob('*.jsonl'):
                 if path.is_symlink() or not path.resolve().is_relative_to(base.resolve()):
                     raise ValueError('会话路径越界')
-                with path.open('rb') as stream:header=json.loads(stream.readline())
+                try:
+                    with path.open('rb') as stream:header=json.loads(stream.readline())
+                except (ValueError,UnicodeError):
+                    target=self._route_for_path(path,routes)
+                    skipped.append({'id':target['id'] if target else 'file:'+path.name,
+                                    'file':path.name,
+                                    'reason':'会话文件头无法解析；原文件未改动'})
+                    continue
+                if not isinstance(header,dict):
+                    skipped.append({'id':'file:'+path.name,'file':path.name,
+                                    'reason':'会话文件头不是对象；原文件未改动'})
+                    continue
                 payload=header.get('payload',{})
+                if not isinstance(payload,dict):
+                    skipped.append({'id':'file:'+path.name,'file':path.name,
+                                    'reason':'会话文件头缺少有效 payload；原文件未改动'})
+                    continue
                 ident=payload.get('id',payload.get('session_id'))
                 if header.get('type')!='session_meta' or ident not in selected:continue
                 scanned.add(ident)
@@ -574,7 +714,7 @@ class Switcher:
             raise ValueError('修复会话路径越界')
         return path
 
-    def session_index(self):
+    def session_index(self,skipped=None):
         index={}
         for category in ('sessions','archived_sessions'):
             base=self.home/category
@@ -582,9 +722,21 @@ class Switcher:
             if not base.exists():continue
             for path in base.rglob('*.jsonl'):
                 self._session_path(str(path.relative_to(self.home)))
-                with path.open('rb') as stream:header=json.loads(stream.readline())
+                try:
+                    with path.open('rb') as stream:header=json.loads(stream.readline())
+                except (ValueError,UnicodeError):
+                    if skipped is not None:
+                        skipped.append({'id':'file:'+path.name,'file':path.name,
+                                        'reason':'会话文件头无法解析；原文件未改动'})
+                    continue
+                if not isinstance(header,dict):
+                    if skipped is not None:
+                        skipped.append({'id':'file:'+path.name,'file':path.name,
+                                        'reason':'会话文件头不是对象；原文件未改动'})
+                    continue
                 if header.get('type')!='session_meta':continue
                 payload=header.get('payload',{})
+                if not isinstance(payload,dict):continue
                 ident=payload.get('id',payload.get('session_id'))
                 if isinstance(ident,str):index.setdefault(ident,[]).append(path)
         return index
@@ -609,8 +761,10 @@ class Switcher:
         protected=[]
         manifests=self.repair_manifests()
         if not manifests:return protected
-        try:index=self.session_index()
+        scan_skipped=[]
+        try:index=self.session_index(scan_skipped)
         except (ValueError,OSError):return [m['id'] for m in manifests]
+        if scan_skipped:return [m['id'] for m in manifests]
         blocked=set()
         if any(len(paths)>1 for paths in index.values()):
             try:
@@ -640,7 +794,8 @@ class Switcher:
         stats={'threads':0,'records':0,'skipped':[]}
         manifests=self.repair_manifests()
         if not manifests:return plans,stats
-        index=self.session_index()
+        scan_skipped=[]
+        index=self.session_index(scan_skipped)
         for manifest in manifests:
             for name,spans in manifest['compatibility'].items():
                 original=self.store.content(manifest['id'],name)
@@ -672,6 +827,7 @@ class Switcher:
                     'reason':'同一会话 ID 存在未受修复备份覆盖的副本，整个会话的文件和路由保留；原始备份继续保护'})
         plans={path:sorted(changes,key=lambda c:c.offset) for path,changes in plans.items()
                if identifiers[path] not in blocked}
+        stats['skipped'].extend(scan_skipped)
         stats['threads']=len({identifiers[path] for path in plans})
         stats['records']=sum(len(changes) for changes in plans.values())
         return plans,stats
@@ -745,7 +901,7 @@ class Switcher:
             cfg=tomllib.loads(text)
             _,profile=profile_config(cfg)
             if profile:raise ValueError('当前 profile 覆盖了设置，请先取消或修改该配置档')
-            search_state=self.search_preferences()
+            search_state=self.search_preferences(strict=True)
             current=logical_provider(cfg)
             current_mode=cfg.get('web_search')
             if current_mode is not None and current_mode not in SEARCH_MODES:
@@ -780,12 +936,21 @@ class Switcher:
                 compatibility,stats=self.compatibility_updates(updated,strict=False)
             else:
                 compatibility,stats=self.compatibility_restore_all({r['id'] for r in updated})
-                index=self.session_index()
+                scan_skipped=[]
+                index=self.session_index(scan_skipped)
+                if scan_skipped:
+                    stats['skipped'].extend(scan_skipped)
                 missing=sorted({r['id'] for r in updated}-set(index))
                 stats.update(scanned=len(updated)-len(missing),unavailable=len(missing),unavailable_ids=missing)
             blocked={s['id'] for s in stats['skipped']}
             updated=[r for r in updated if r['id'] not in blocked]
-            updates=self.header_updates(updated)
+            header_skipped=[]
+            header_blocked=set()
+            updates=self.header_updates(updated,skipped=header_skipped,blocked=header_blocked)
+            if header_blocked:
+                stats['skipped'].extend(header_skipped)
+                blocked |= header_blocked
+                updated=[r for r in updated if r['id'] not in header_blocked]
             # Both directions need an operation journal; only GPT repairs need
             # long-term protection of original DeepSeek reasoning.
             snapshot=self.snapshot(compatibility if provider=='openai' else None,
@@ -843,7 +1008,11 @@ class Switcher:
                 current=tomllib.loads(text).get('model_providers',{}).get('deepseek',{})
                 text=(set_deepseek_key(text,stored) if stored and not configured_key(current)
                       else provider_auth_config(text) if any(r['model_provider']=='ds_api' for r in routes) else text)
-            updates=self.header_updates(routes)
+            header_skipped=[]
+            header_blocked=set()
+            updates=self.header_updates(routes,skipped=header_skipped,blocked=header_blocked)
+            if header_blocked:
+                routes=[r for r in routes if r['id'] not in header_blocked]
             repair_manifest=original
             if not original.get('file_changes') and not original.get('compatibility') and self.pending.exists():
                 pending=json.loads(self.pending.read_text())
@@ -871,7 +1040,53 @@ class Switcher:
                     'config_rebuilt':rebuilt,'saved_config':str(saved_config) if saved_config else None,
                     'message':('已从备份重建配置；损坏文件已单独保留，未备份的设置需手动合并；缺失密钥请重新填写。' if saved_config else
                                '已从备份重建缺失配置；缺失密钥请重新填写。' if rebuilt else '')+
-                              '已恢复模型、服务商与联网设置；恢复点之后的新会话、新消息均保留。'}
+                              '已恢复模型、服务商与联网设置；恢复点之后的新会话、新消息均保留。'+
+                              (('另有 '+str(len(header_blocked))+' 个会话文件头无法解析，未改动其文件和路由。') if header_blocked else '')}
+
+    def recover_database(self,ident):
+        """Replace only missing or corrupt databases from a verified snapshot."""
+        with self.lock(allow_pending=True):
+            original=self.store.verify(ident)
+            states=self.database_state(self.home)
+            targets=[name for name in ('state_5.sqlite','thread_history_1.sqlite')
+                     if name in original['files'] and
+                     ((name=='state_5.sqlite' and states.get(name) in ('invalid','missing')) or
+                      (name=='thread_history_1.sqlite' and states.get(name)=='invalid'))]
+            if not targets:
+                raise ValueError('当前数据库没有检测到损坏或缺失，或备份中没有对应数据库；未替换任何文件')
+            recovery=self.data/'database-recovery'
+            if recovery.is_symlink():raise ValueError('数据库恢复目录不能是符号链接')
+            recovery.mkdir(mode=0o700,exist_ok=True);recovery.chmod(0o700)
+            saved=recovery/str(uuid.uuid4());saved.mkdir(mode=0o700)
+            moved=[];written=[]
+            try:
+                for name in targets:
+                    data=self.store.content(ident,name)
+                    if not sqlite_database_ok(data):
+                        raise ValueError('备份中的 '+name+' 无法通过完整性检查，未替换')
+                    target=self.home/name
+                    if target.is_symlink():raise ValueError(name+' 不能是符号链接')
+                    if target.exists():
+                        shutil.move(str(target),str(saved/name));moved.append((target,saved/name))
+                    for suffix in ('-wal','-shm','-journal'):
+                        side=Path(str(target)+suffix)
+                        if side.exists():
+                            if side.is_symlink():raise ValueError(name+suffix+' 不能是符号链接')
+                            shutil.move(str(side),str(saved/(name+suffix)))
+                            moved.append((side,saved/(name+suffix)))
+                    atomic_write(target,data);written.append(target)
+                for name in targets:
+                    if not sqlite_database_ok((self.home/name).read_bytes()):
+                        raise ValueError('恢复后的 '+name+' 未通过完整性检查')
+                sync_directory(self.home)
+            except Exception:
+                for target in written:target.unlink(missing_ok=True)
+                for original_path,saved_path in reversed(moved):
+                    if saved_path.exists():shutil.move(str(saved_path),str(original_path))
+                raise
+            return {'restored':ident,'databases':targets,'saved':str(saved),
+                    'message':'已从备份替换 '+('、'.join(targets))+'；原损坏文件保留在 '+str(saved)+
+                              '。备份之后新建的会话可能需要重新打开或重新扫描。'}
 
     def repair_compatibility(self,ident=None):
         with self.lock():
@@ -917,9 +1132,15 @@ class Switcher:
             blocked={r['id'] for r in stats['skipped']}
             updated=[{**r,'model_provider':provider,'model':model,'reasoning_effort':effort}
                      for r in selected if r['id'] not in blocked]
+            header_skipped=[]
+            header_blocked=set()
+            updates=self.header_updates(updated,skipped=header_skipped,blocked=header_blocked)
+            if header_blocked:
+                stats['skipped'].extend(header_skipped)
+                blocked |= header_blocked
+                updated=[r for r in updated if r['id'] not in header_blocked]
             previous={r['id']:r for r in selected}
             changed=[r for r in updated if r!=previous[r['id']]]
-            updates=self.header_updates(updated)
             result={'provider':'deepseek','model':model,'compatibility':stats,
                     'repaired':len(changed),'headers':len(updates)}
             detail=('已检查 '+str(stats['scanned'])+' 个本机会话；还原 '+str(stats['records'])+
@@ -946,7 +1167,12 @@ class Switcher:
             affected=[r for r in routes if r['model_provider'] in migration_providers(cfg)]
             updated=[{**r,'model_provider':provider,'model':model,'reasoning_effort':effort} for r in affected]
             changed=[r for r in affected if (r['model_provider'],r['model'],r['reasoning_effort'])!=(provider,model,effort)]
-            updates=self.header_updates(updated)
+            header_skipped=[]
+            header_blocked=set()
+            updates=self.header_updates(updated,skipped=header_skipped,blocked=header_blocked)
+            if header_blocked:
+                updated=[r for r in updated if r['id'] not in header_blocked]
+                changed=[r for r in changed if r['id'] not in header_blocked]
             logical='deepseek' if provider in ('ds_api','deepseek') else 'openai'
             if not changed and not updates:
                 return {'repaired':0,'provider':logical,'model':model,
@@ -1108,6 +1334,7 @@ class Switcher:
             return result(True,'已'+('复用' if reused else '创建')+label+'兼容接续，并验证回复成功；原会话保留。')
 
     def status(self):
+        warnings=[]
         config=tomllib.loads(self.config.read_text())
         live=self.runtime_status(config)
         with self.connect(True) as con:
@@ -1118,11 +1345,13 @@ class Switcher:
             activity=('coalesce('+','.join(activities)+',0)' if activities else '0')+' as activity_ms'
             threads=[dict(r) for r in con.execute(
                 'select id,'+title+',model_provider,model,archived,'+activity+' from threads order by '+order)]
-        snapshots=configuration_backups(self.store)
+        backup_errors=[]
+        snapshots=configuration_backups(self.store,backup_errors)
+        if backup_errors:
+            warnings.append(str(len(backup_errors))+' 份备份清单无法读取；已跳过，未删除任何备份。')
         links_path=self.data/'links.json'
-        from .diagnostics import read_json
-        links=read_json(links_path,{})
-        bridge_states=read_json(self.data/'bridge-state.json',{})
+        links=self._tool_json('links.json',{},dict,warnings)
+        bridge_states=self._tool_json('bridge-state.json',{},dict,warnings)
         logical=live['provider']
         for thread in threads:
             entry=bridge_states.get(thread['id'],{}).get(logical,{})
@@ -1141,15 +1370,22 @@ class Switcher:
         except (ValueError,OSError):
             preview={'threads':0,'records':0,'skipped':[],
                      'error':'无法读取还原计划，切换前将重新检查备份；不会自动覆盖会话。'}
-        last_switch=read_json(self.data/'last-switch.json',None)
+        last_switch=self._tool_json('last-switch.json',None,dict,warnings)
         if last_switch and (last_switch.get('provider')!=logical or last_switch.get('model')!=live['model']):last_switch=None
+        pending=None
+        pending_error=False
+        if self.pending.exists():
+            try:pending=json.loads(self.pending.read_text())
+            except (ValueError,UnicodeError):
+                pending_error=True
+                warnings.append('pending.json 无法解析；已阻止新的写入，请先检查未完成的操作。')
         return {**live,'threads':threads,'last_switch':last_switch,
                 'switch_days':30,
                 'recent_thread_count':sum(1 for t in threads
                                           if not t['activity_ms'] or t['activity_ms']>= (time.time()-30*86400)*1000),
-                'ignored_attention':self.attention_ignores(),
+                'ignored_attention':self.attention_ignores(warnings),
                 'backups':[{'id':s['id'],'created_at':s['created_at'],'files':len(s['files'])} for s in snapshots],
-                'settings':self.settings(),
-                'pending':json.loads(self.pending.read_text()) if self.pending.exists() else None,
+                'settings':self.settings(warnings),
+                'pending':pending,'pending_error':pending_error,'warnings':warnings,
                 'backup_path':str(self.store.root),
                 'key_configured':key_configured,'key_storage':key_storage,'deepseek_restore':preview}

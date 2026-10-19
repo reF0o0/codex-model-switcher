@@ -22,3 +22,18 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Test backend without network or credentials
         run: python -B -m unittest discover -s tests -v
+
+  macos:
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: Type-check the Swift app
+        run: swiftc -parse-as-library -D SWITCHER_MODEL_CHECKS -typecheck app/App.swift
+      - name: Check process timeout and stderr capture
+        run: python -B scripts/check_process_timeout.py
+      - name: Check the production AppModel recovery flow
+        run: python -B scripts/check_app_recovery.py

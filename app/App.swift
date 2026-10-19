@@ -1,6 +1,90 @@
 import SwiftUI
 import AppKit
 
+struct ProcessRunResult {
+    let stdout: Data
+    let stderr: String
+    let status: Int32
+}
+
+enum ProcessRunError: LocalizedError {
+    case timeout(TimeInterval,String)
+    case input(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .timeout(let seconds,let detail):
+            let tail = detail.isEmpty ? "" : " 后端输出：" + detail
+            return "后端超过 \(Int(seconds)) 秒未返回，已终止本次操作。若这是写入操作，请检查备份页的未完成提示。" + tail
+        case .input(let detail):
+            return "无法把请求交给后端。\(detail)"
+        }
+    }
+}
+
+func runProcess(executable:URL,arguments:[String],input:Data,
+                currentDirectory:URL?=nil,timeout:TimeInterval) throws -> ProcessRunResult {
+    let task = Process()
+    task.executableURL = executable
+    task.arguments = arguments
+    if let currentDirectory {task.currentDirectoryURL = currentDirectory}
+    let output = Pipe(), stdin = Pipe()
+    task.standardOutput = output
+    task.standardInput = stdin
+    let errorURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("switcher-stderr-\(UUID().uuidString)")
+    FileManager.default.createFile(atPath:errorURL.path,contents:nil)
+    let errorHandle: FileHandle
+    do { errorHandle = try FileHandle(forWritingTo:errorURL) }
+    catch { throw ProcessRunError.input("无法创建错误输出文件。") }
+    defer {
+        try? errorHandle.close()
+        try? FileManager.default.removeItem(at:errorURL)
+    }
+    task.standardError = errorHandle
+    defer {if task.isRunning {task.terminate()}}
+    try task.run()
+    do {
+        try stdin.fileHandleForWriting.write(contentsOf:input)
+        try stdin.fileHandleForWriting.close()
+    } catch {
+        let detail = (try? String(contentsOf:errorURL,encoding:.utf8)) ?? ""
+        throw ProcessRunError.input(detail.isEmpty ? error.localizedDescription : detail)
+    }
+
+    let readSemaphore = DispatchSemaphore(value:0)
+    let outputBox = NSMutableData()
+    DispatchQueue.global(qos:.utility).async {
+        outputBox.append(output.fileHandleForReading.readDataToEndOfFile())
+        readSemaphore.signal()
+    }
+    if readSemaphore.wait(timeout:.now()+timeout) == .timedOut {
+        task.interrupt()
+        if readSemaphore.wait(timeout:.now()+2) == .timedOut {task.terminate()}
+        _ = readSemaphore.wait(timeout:.now()+2)
+        let detail = (try? String(contentsOf:errorURL,encoding:.utf8)) ?? ""
+        throw ProcessRunError.timeout(timeout,detail)
+    }
+    let exitSemaphore = DispatchSemaphore(value:0)
+    task.terminationHandler = {_ in exitSemaphore.signal()}
+    if task.isRunning && exitSemaphore.wait(timeout:.now()+max(1,timeout)) == .timedOut {
+        task.terminate()
+        let detail = (try? String(contentsOf:errorURL,encoding:.utf8)) ?? ""
+        throw ProcessRunError.timeout(timeout,detail)
+    }
+    let stderr = (try? String(contentsOf:errorURL,encoding:.utf8)) ?? ""
+    return ProcessRunResult(stdout:outputBox as Data,stderr:stderr,status:task.terminationStatus)
+}
+
+func redactedBackendError(_ text:String) -> String {
+    var value = text
+    for pattern in ["sk-[A-Za-z0-9._\\-]{6,}","gho_[A-Za-z0-9]{20,}"] {
+        value = value.replacingOccurrences(of:pattern,with:"<redacted>",options:.regularExpression)
+    }
+    let trimmed = value.trimmingCharacters(in:.whitespacesAndNewlines)
+    return trimmed.isEmpty ? "" : " 后端输出：" + String(trimmed.suffix(1200))
+}
+
 struct DirectoryGrantStore {
     static let key = "directory-access-bookmarks-v1"
     let defaults: UserDefaults
@@ -50,8 +134,19 @@ struct FileAccessReport: Decodable {
 struct RecoveryStatus: Decodable {
     let config_state: String
     let backups: [BackupRow]
+    let database_state: [String:String]?
+    let database_backups: [BackupRow]?
+    let unreadable_backups: Int?
     let desktop_check: String
     let checked_at: Double
+}
+extension RecoveryStatus {
+    var configBad: Bool {["missing","invalid"].contains(config_state)}
+    var databaseBad: Bool {
+        let primary = database_state?["state_5.sqlite"]
+        let history = database_state?["thread_history_1.sqlite"]
+        return ["invalid","missing"].contains(primary ?? "") || history == "invalid"
+    }
 }
 
 struct ThreadRow: Identifiable, Decodable {
@@ -151,6 +246,8 @@ struct Snapshot: Decodable {
     let deepseek_restore: RestorePreview?
     let web_search: SearchState
     let checked_at: Double
+    let warnings: [String]?
+    let pending_error: Bool?
 
     let last_switch: SwitchSummary?
     let ignored_attention: [String]
@@ -158,7 +255,8 @@ struct Snapshot: Decodable {
     let recent_thread_count: Int
     var liveStatus: LiveStatus {
         LiveStatus(provider:provider,model:model,effort:effort,desktop_check:desktop_check,
-                   pending_operation:pending != nil,checked_at:checked_at,web_search:web_search)
+                   pending_operation:pending != nil || pending_error == true,
+                   checked_at:checked_at,web_search:web_search)
     }
 }
 
@@ -179,13 +277,16 @@ final class AppModel: ObservableObject {
     @Published var effort = "high"
     @Published var keep = 10
     @Published var days = 30
+    @Published var switchDays = 30
     @Published var autoCleanup = true
     @Published var tab = 0
     @Published var query = ""
     @Published var showArchived = false
     @Published var restoreID: String? = nil
+    @Published var databaseRestoreID: String? = nil
     @Published var confirmSwitch = false
     @Published var confirmRestore = false
+    @Published var confirmDatabaseRestore = false
     @Published var confirmRepair = false
     @Published var confirmFormatRepair = false
     @Published var confirmDeepSeekRepair = false
@@ -202,7 +303,9 @@ final class AppModel: ObservableObject {
     @Published var errorNeedsPermission = false
     @Published var expandedAttentionGroups: Set<String> = []
     @Published var key = ""
+    @Published var keySaved = false
     var loaded = false
+    private var pythonExecutable: String?
     var openThread: (String) -> Void = {id in
         if let url = URL(string:"codex://threads/\(id)") {NSWorkspace.shared.open(url)}
     }
@@ -261,13 +364,13 @@ final class AppModel: ObservableObject {
         }
     }
     var switchTitle: String {
-        let days=snapshot?.switch_days ?? 30
-        return provider == "deepseek" ? "备份、还原并切换最近 \(days) 天" : "备份并切换最近 \(days) 天"
+        return provider == "deepseek" ? "备份、还原并切换最近 \(switchDays) 天" : "备份并切换最近 \(switchDays) 天"
     }
     var desktopCheck: String {recovery?.desktop_check ?? (liveError == nil ? (live?.desktop_check ?? "unknown") : "unknown")}
     var canManageFiles: Bool {!busy && !checkingAccess && fileAccess?.ready == true}
     var canWrite: Bool {canManageFiles && desktopCheck == "stopped" && live?.pending_operation == false}
     var canRecover: Bool {!busy && !checkingAccess && fileAccess?.canRestore == true && recovery?.desktop_check == "stopped"}
+    var canRecoverDatabase: Bool {canRecover}
     var enableSearch: Bool {live?.web_search.state == "catalog" || !["live","cached"].contains(live?.web_search.mode ?? "")}
     var providerName: String {
         switch live?.provider {case "deepseek":return "DeepSeek";case "openai":return "GPT";default:return "当前服务商"}
@@ -365,29 +468,27 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func execute(_ command: String, _ payload: [String:Any] = [:]) throws -> Data {
-        let paths = ["/Library/Frameworks/Python.framework/Versions/3.13/bin/python3",
-                     "/opt/homebrew/bin/python3.13", "/opt/homebrew/bin/python3",
-                     "/usr/local/bin/python3", "/usr/bin/python3"]
-        guard let python = paths.first(where: {FileManager.default.isExecutableFile(atPath:$0)}),
+    func execute(_ command: String, _ payload: [String:Any] = [:], timeout: TimeInterval? = nil) throws -> Data {
+        guard let python = supportedPython(),
               let resource = Bundle.main.resourceURL else {
-            throw NSError(domain:"Switcher",code:1,userInfo:[NSLocalizedDescriptionKey:"找不到 Python 3.11+。请按随附使用说明安装。"])
+            throw NSError(domain:"Switcher",code:1,userInfo:[NSLocalizedDescriptionKey:
+                "找不到 Python 3.11+。已检查常见安装位置和 PATH；请安装 Python 3.11+ 或 Homebrew python3，然后重新打开本工具。"])
         }
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath:python)
-        // Finder may otherwise leave a protected Documents directory as the child's cwd.
-        task.currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
-        task.arguments = ["-B", "-s", "-E", resource.appendingPathComponent("backend/cli.py").path, command]
-        let output = Pipe(), input = Pipe(), errors = Pipe()
-        task.standardOutput = output; task.standardInput = input; task.standardError = errors
-        try task.run()
         let bytes = try JSONSerialization.data(withJSONObject:payload)
-        input.fileHandleForWriting.write(bytes)
-        try input.fileHandleForWriting.close()
-        let result = output.fileHandleForReading.readDataToEndOfFile()
-        task.waitUntilExit()
-        guard let json = try JSONSerialization.jsonObject(with:result) as? [String:Any] else {
-            throw NSError(domain:"Switcher",code:2,userInfo:[NSLocalizedDescriptionKey:"后端未返回有效结果，请检查 Python 版本。"])
+        let run: ProcessRunResult
+        do {
+            run = try runProcess(executable:URL(fileURLWithPath:python),
+                                 arguments:["-B", "-s", "-E",
+                                            resource.appendingPathComponent("backend/cli.py").path, command],
+                                 input:bytes,
+                                 currentDirectory:FileManager.default.homeDirectoryForCurrentUser,
+                                 timeout:timeout ?? defaultTimeout(command))
+        } catch {
+            throw NSError(domain:"Switcher",code:4,userInfo:[NSLocalizedDescriptionKey:error.localizedDescription])
+        }
+        guard let json = try JSONSerialization.jsonObject(with:run.stdout) as? [String:Any] else {
+            throw NSError(domain:"Switcher",code:2,userInfo:[NSLocalizedDescriptionKey:
+                "后端未返回有效结果，请检查 Python 版本。" + redactedBackendError(run.stderr)])
         }
         guard json["ok"] as? Bool == true, let value = json["result"] else {
             var info: [String:Any] = [NSLocalizedDescriptionKey:json["error"] as? String ?? "操作失败；请检查文件权限。"]
@@ -399,17 +500,66 @@ final class AppModel: ObservableObject {
         return try JSONSerialization.data(withJSONObject:value)
     }
 
+    private func supportedPython() -> String? {
+        if let pythonExecutable, FileManager.default.isExecutableFile(atPath:pythonExecutable) {
+            return pythonExecutable
+        }
+        var candidates = ["/Library/Frameworks/Python.framework/Versions/3.14/bin/python3",
+                          "/Library/Frameworks/Python.framework/Versions/3.13/bin/python3",
+                          "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3",
+                          "/Library/Frameworks/Python.framework/Versions/3.11/bin/python3",
+                          "/opt/homebrew/bin/python3.14", "/opt/homebrew/bin/python3.13",
+                          "/opt/homebrew/bin/python3.12", "/opt/homebrew/bin/python3.11",
+                          "/opt/homebrew/bin/python3", "/usr/local/bin/python3.14",
+                          "/usr/local/bin/python3.13", "/usr/local/bin/python3.12",
+                          "/usr/local/bin/python3.11", "/usr/local/bin/python3",
+                          "/usr/bin/python3"]
+        if let path = ProcessInfo.processInfo.environment["PATH"] {
+            for folder in path.split(separator:":") {
+                candidates.append(String(folder)+"/python3")
+            }
+        }
+        var seen=Set<String>()
+        for candidate in candidates where seen.insert(candidate).inserted {
+            guard FileManager.default.isExecutableFile(atPath:candidate) else {continue}
+            let probe = try? runProcess(executable:URL(fileURLWithPath:candidate),
+                                        arguments:["-c","import sys, tomllib; raise SystemExit(0 if sys.version_info >= (3,11) else 1)"],
+                                        input:Data(),timeout:5)
+            if probe?.status == 0 {
+                pythonExecutable = candidate
+                return candidate
+            }
+        }
+        return nil
+    }
+
+    private func defaultTimeout(_ command:String) -> TimeInterval {
+        switch command {
+        case "status","startup","permissions","live-status","recovery-status","diagnose":return 90
+        case "backup","switch","restore","recover-database","repair","repair-formats","repair-deepseek","web-search":return 900
+        case "bridge":return 600
+        default:return 300
+        }
+    }
+
     func readRecovery() -> RecoveryStatus? {
-        guard let state = try? JSONDecoder().decode(RecoveryStatus.self,from:execute("recovery-status")),
-              ["missing","invalid"].contains(state.config_state) else {return nil}
-        return state
+        guard let state = try? JSONDecoder().decode(RecoveryStatus.self,from:execute("recovery-status")) else {return nil}
+        let configBad = ["missing","invalid"].contains(state.config_state)
+        let databaseBad = state.databaseBad
+        return configBad || databaseBad ? state : nil
     }
 
     func showRecovery(_ state: RecoveryStatus) {
         recovery = state; snapshot = nil; live = nil; liveError = nil; loaded = false
         diagnoses = [:]; operationAttention = []
         if !state.backups.contains(where: {$0.id == restoreID}) {restoreID = state.backups.first?.id}
-        notice = "当前配置缺失或损坏。请选择备份恢复；写入前仍需退出 ChatGPT/Codex。"
+        if !(state.database_backups ?? []).contains(where: {$0.id == databaseRestoreID}) {
+            databaseRestoreID = state.database_backups?.first?.id
+        }
+        let configBad = ["missing","invalid"].contains(state.config_state)
+        let databaseBad = state.databaseBad
+        notice = databaseBad && !configBad ? "数据库无法通过完整性检查。请选择含有效数据库的备份；写入前仍需退出 ChatGPT/Codex。"
+                 : "当前配置缺失或损坏。请选择备份恢复；写入前仍需退出 ChatGPT/Codex。"
     }
 
     func run(_ command: String, _ payload: [String:Any] = [:]) {
@@ -420,7 +570,7 @@ final class AppModel: ObservableObject {
         DispatchQueue.global(qos:.userInitiated).async {
             do {
                 var access = try JSONDecoder().decode(FileAccessReport.self,from:self.execute("permissions"))
-                guard access.ready || (command == "restore" && access.canRestore) else {
+                guard access.ready || ((command == "restore" || command == "recover-database") && access.canRestore) else {
                     let recovery = self.readRecovery()
                     DispatchQueue.main.async {
                         self.fileAccess = access; self.accessError = nil; self.busy = false
@@ -469,7 +619,7 @@ final class AppModel: ObservableObject {
                         report = lines.joined(separator:"\n")
                     }
                 }
-                if command == "restore" {
+                if command == "restore" || command == "recover-database" {
                     access = try JSONDecoder().decode(FileAccessReport.self,from:self.execute("permissions"))
                 }
                 let status = try JSONDecoder().decode(Snapshot.self,from:self.execute(command == "startup" ? "startup" : "status"))
@@ -494,6 +644,7 @@ final class AppModel: ObservableObject {
                     if let message = message {self.notice = message}
                     else if command == "startup" {self.notice = "已加载全部历史。写入前先退出 ChatGPT/Codex，再点刷新；完成后重新打开。"}
                     self.busy = false
+                    if command == "save-key" {self.keySaved = true}
                     if let report = report {self.report = report}
                     if let tid = newThread {self.openThread(tid)}
                 }
@@ -560,25 +711,56 @@ struct ContentView: View {
                         .font(.callout).foregroundStyle(.orange)
                 }
                 if let error = app.liveError {Text(error).font(.caption).foregroundStyle(.orange)}
+                if let warnings = app.snapshot?.warnings, !warnings.isEmpty {
+                    DisclosureGroup("工具状态提示 \(warnings.count)") {
+                        VStack(alignment:.leading,spacing:4) {
+                            ForEach(warnings,id:\.self) {warning in
+                                Text(warning).font(.caption).foregroundStyle(.secondary)
+                            }
+                        }.frame(maxWidth:.infinity,alignment:.leading)
+                    }.font(.caption)
+                }
             }
             if let recovery = app.recovery {
-                GroupBox("配置应急恢复") {
-                    VStack(alignment:.leading,spacing:8) {
-                        Text(recovery.config_state == "missing" ? "config.toml 已缺失，仍可从备份恢复。" : "config.toml 无法解析，仍可从备份恢复。")
-                            .foregroundStyle(.orange)
-                        Text("将从备份重建配置、恢复模型与路由，并保留新增消息。现存损坏配置会单独保留；未备份的设置需手动合并，缺失密钥需重新填写。")
-                            .font(.caption).foregroundStyle(.secondary)
-                        if recovery.backups.isEmpty {
-                            Text("未找到含有效配置的本机备份；请保留现有数据并从原备份手动恢复配置。")
-                        } else {
-                            HStack {
-                                Picker("选择备份",selection:$app.restoreID) {
-                                    ForEach(recovery.backups) {backup in
-                                        Text(backup.created_at + " · " + backup.id).tag(Optional(backup.id))
+                GroupBox("应急恢复") {
+                    VStack(alignment:.leading,spacing:10) {
+                        if recovery.databaseBad {
+                            Text("Codex 数据库无法通过完整性检查。先替换损坏或缺失的数据库，再处理配置。")
+                                .foregroundStyle(.orange)
+                            Text("只会替换损坏的数据库；原文件保留在工具数据目录，备份之后新建的会话可能需要重新扫描。写入前仍需退出 ChatGPT/Codex。")
+                                .font(.caption).foregroundStyle(.secondary)
+                            if let backups = recovery.database_backups, !backups.isEmpty {
+                                HStack {
+                                    Picker("数据库备份",selection:$app.databaseRestoreID) {
+                                        ForEach(backups) {backup in
+                                            Text(backup.created_at + " · " + backup.id).tag(Optional(backup.id))
+                                        }
                                     }
+                                    Button("从备份修复数据库") {app.confirmDatabaseRestore = true}
+                                        .disabled(!app.canRecoverDatabase || app.databaseRestoreID == nil)
                                 }
-                                Button("从备份恢复") {app.confirmRestore = true}
-                                    .disabled(!app.canRecover || app.restoreID == nil)
+                            } else {
+                                Text("未找到含有效数据库的备份；请保留现有数据并从原备份手动恢复。")
+                                    .font(.caption).foregroundStyle(.orange)
+                            }
+                        }
+                        if recovery.configBad {
+                            Text(recovery.config_state == "missing" ? "config.toml 已缺失，仍可从备份恢复。" : "config.toml 无法解析，仍可从备份恢复。")
+                                .foregroundStyle(.orange)
+                            Text("将从备份重建配置、恢复模型与路由，并保留新增消息。现存损坏配置会单独保留；未备份的设置需手动合并，缺失密钥需重新填写。")
+                                .font(.caption).foregroundStyle(.secondary)
+                            if recovery.backups.isEmpty {
+                                Text("未找到含有效配置的本机备份；请保留现有数据并从原备份手动恢复配置。")
+                            } else {
+                                HStack {
+                                    Picker("选择备份",selection:$app.restoreID) {
+                                        ForEach(recovery.backups) {backup in
+                                            Text(backup.created_at + " · " + backup.id).tag(Optional(backup.id))
+                                        }
+                                    }
+                                    Button("从备份恢复配置") {app.confirmRestore = true}
+                                        .disabled(!app.canRecover || app.restoreID == nil)
+                                }
                             }
                         }
                         Button("重新检查") {app.run("status")}.disabled(app.busy || app.checkingAccess)
@@ -635,11 +817,14 @@ struct ContentView: View {
                 HStack {
                     Spacer()
                     Button("关闭") {app.showKeySheet=false}.keyboardShortcut(.cancelAction)
-                    Button("保存") {app.run("save-key",["key":app.key]);app.key="";app.showKeySheet=false}
+                    Button("保存") {app.run("save-key",["key":app.key])}
                         .disabled(app.key.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty || !app.canWrite)
                         .keyboardShortcut(.defaultAction)
                 }
             }.padding(24).frame(width:460)
+            .onChange(of:app.keySaved) {_,saved in
+                if saved {app.key="";app.showKeySheet=false;app.keySaved=false}
+            }
         }
         .padding(24).frame(minWidth:840,minHeight:660)
         .onAppear {app.run("startup")}
@@ -650,14 +835,18 @@ struct ContentView: View {
             }
             Button("知道了",role:.cancel) {app.error=nil; app.errorNeedsPermission=false}
         } message: {Text(app.error ?? "")}
-        .confirmationDialog("把最近 \(app.snapshot?.switch_days ?? 30) 天的 GPT／DeepSeek 会话切到 \(app.model)？",isPresented:$app.confirmSwitch,titleVisibility:.visible) {
-            Button(app.switchTitle) {app.run("switch",["provider":app.provider,"model":app.model,"effort":app.effort,"days":app.snapshot?.switch_days ?? 30])}
+        .confirmationDialog("把最近 \(app.switchDays) 天的 GPT／DeepSeek 会话切到 \(app.model)？",isPresented:$app.confirmSwitch,titleVisibility:.visible) {
+            Button(app.switchTitle) {app.run("switch",["provider":app.provider,"model":app.model,"effort":app.effort,"days":app.switchDays])}
             Button("取消",role:.cancel) {}
         } message: {Text(app.provider == "openai" ? "先备份，再切换并自动修复已验证的 DeepSeek 推理格式。未知格式会话跳过并保留原路由，完成后查看处理明细。先退出 ChatGPT。" : "先备份，再切到 DeepSeek，并还原之前修复过的原始推理记录。修复位置被其他操作改动过的会话会跳过并保留现状。先退出 ChatGPT。")}
         .confirmationDialog("恢复选中的模型、路由与联网设置？",isPresented:$app.confirmRestore,titleVisibility:.visible) {
             Button("创建安全备份并恢复") {if let id=app.restoreID {app.run("restore",["id":id])}}
             Button("取消",role:.cancel) {}
         } message: {Text(app.recovery == nil ? "恢复点之后的新会话和新消息仍会保留。此功能不会用旧数据库覆盖当前历史。" : "当前配置缺失或损坏，将从备份重建配置并恢复模型与路由。损坏文件会单独保留，未备份的设置需手动合并，缺失密钥需重新填写。新增会话和消息仍保留。")}
+        .confirmationDialog("从备份修复数据库？",isPresented:$app.confirmDatabaseRestore,titleVisibility:.visible) {
+            Button("替换损坏或缺失的数据库") {if let id=app.databaseRestoreID {app.run("recover-database",["id":id])}}
+            Button("取消",role:.cancel) {}
+        } message: {Text("只替换无法通过完整性检查的数据库；当前文件会单独保留。备份之后新建的会话可能需要重新扫描，配置和其他数据库不在此步骤中改动。")}
         .confirmationDialog("只修复当前模型的路由？",isPresented:$app.confirmRepair,titleVisibility:.visible) {
             Button("备份并修复") {app.run("repair")}
             Button("取消",role:.cancel) {}
@@ -758,6 +947,16 @@ struct ContentView: View {
                         Text("High").tag("high")
                     }.frame(width:160)
                 }
+                HStack(spacing:12) {
+                    Text("切换范围")
+                    Picker("切换范围",selection:$app.switchDays) {
+                        Text("最近 30 天").tag(30)
+                        Text("最近 90 天").tag(90)
+                        Text("最近 365 天").tag(365)
+                    }.pickerStyle(.segmented).frame(width:360)
+                }
+                Text("更早的会话不会随切换迁移；需要对齐全部旧会话时，使用下方“维护工具 → 只修复路由”。")
+                    .font(.caption).foregroundStyle(.secondary)
 
                 if app.live?.provider == "deepseek" {
                     HStack {
