@@ -4,7 +4,7 @@ import sys
 sys.dont_write_bytecode = True
 from switcher.core import Switcher
 
-PAYLOAD_COMMANDS=['switch','restore','settings','save-key','bridge','repair-formats']
+PAYLOAD_COMMANDS=['switch','restore','settings','save-key','bridge','repair-formats','repair-deepseek','web-search']
 
 
 def payload():
@@ -26,18 +26,21 @@ def require(data,name,what):
 def main():
     p=argparse.ArgumentParser()
     p.add_argument('--home')
-    p.add_argument('command',choices=['status','startup','switch','backup','restore','cleanup','settings','save-key','bridge','repair','repair-formats'])
+    p.add_argument('command',choices=['status','startup','live-status','switch','backup','restore','cleanup','settings','save-key','bridge','repair','repair-formats','repair-deepseek','web-search'])
     args=p.parse_args()
     data=payload() if args.command in PAYLOAD_COMMANDS else {}
     app=Switcher(args.home)
     if args.command in ['status','startup']:
         if args.command=='startup' and app.settings()['auto_cleanup']:app.cleanup()
         result=app.status()
+    elif args.command=='live-status':result=app.runtime_status()
     elif args.command=='switch':result=app.switch(require(data,'provider','服务商'),require(data,'model','模型'),data.get('effort','high'))
     elif args.command=='backup':result=app.backup()
     elif args.command=='restore':result=app.restore(require(data,'id','备份 ID'))
     elif args.command=='repair':result=app.repair()
     elif args.command=='repair-formats':result=app.repair_compatibility(data.get('id'))
+    elif args.command=='repair-deepseek':result=app.repair_deepseek(data.get('id'))
+    elif args.command=='web-search':result=app.set_web_search(data.get('enabled'))
     elif args.command=='cleanup':result={'removed':len(app.cleanup())}
     elif args.command=='settings':result=app.save_settings(int(data.get('keep',0)),int(data.get('days',0)),data.get('auto_cleanup',True))
     elif args.command=='bridge':result=app.bridge(require(data,'id','会话 ID'))

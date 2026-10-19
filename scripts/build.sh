@@ -9,6 +9,7 @@ mkdir -p "$task_build_app/Contents/MacOS" "$task_build_app/Contents/Resources/ba
 /usr/bin/swiftc -parse-as-library -O -target arm64-apple-macosx14.0 \
   "$task_root/app/App.swift" -o "$task_build_app/Contents/MacOS/ProviderSwitcher"
 /usr/bin/rsync -a --exclude __pycache__ --exclude '*.pyc' "$task_root/src/" "$task_build_app/Contents/Resources/backend/"
+/bin/cp "$task_root/assets/ProviderGPT.png" "$task_root/assets/ProviderDeepSeek.png" "$task_build_app/Contents/Resources/"
 task_iconset="$task_staging/AppIcon.iconset"
 mkdir -p "$task_iconset"
 for task_size in 16 32 128 256 512; do
