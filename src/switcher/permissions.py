@@ -124,7 +124,7 @@ def check_permissions(home=None):
             check(label, home / name, directory=True, recursive=True)
         # Backups are immutable; reading them and probing their directories is enough.
         check('备份与工具数据', home / 'provider-switcher', directory=True, recursive=True, writable=False)
-        for name in ('settings.json', 'search-state.json', 'links.json', 'pending.json', 'operation.lock'):
+        for name in ('settings.json', 'search-state.json', 'links.json', 'bridge-state.json', 'last-switch.json', 'pending.json', 'operation.lock'):
             check('工具设置：' + name, home / 'provider-switcher' / name)
     ready = all(c['status'] in ('ok', 'optional') for c in checks)
     return {'ready': ready, 'checked_at': time.time(), 'checks': checks,

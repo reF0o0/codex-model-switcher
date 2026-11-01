@@ -5,7 +5,7 @@ sys.dont_write_bytecode = True
 from switcher.core import Switcher
 from switcher.permissions import check_permissions, require_permissions, PermissionCheckError
 
-PAYLOAD_COMMANDS=['switch','restore','settings','save-key','bridge','repair-formats','repair-deepseek','web-search']
+PAYLOAD_COMMANDS=['switch','restore','settings','save-key','bridge','diagnose','repair-formats','repair-deepseek','web-search']
 
 
 def payload():
@@ -27,12 +27,16 @@ def require(data,name,what):
 def main():
     p=argparse.ArgumentParser()
     p.add_argument('--home')
-    p.add_argument('command',choices=['permissions','status','startup','live-status','switch','backup','restore','cleanup','settings','save-key','bridge','repair','repair-formats','repair-deepseek','web-search'])
+    p.add_argument('command',choices=['permissions','diagnose','status','startup','live-status','switch','backup','restore','cleanup','settings','save-key','bridge','repair','repair-formats','repair-deepseek','web-search'])
     args=p.parse_args()
     data=payload() if args.command in PAYLOAD_COMMANDS else {}
     # Permission reporting must work even when Switcher cannot create its data directory.
     if args.command=='permissions':
         print(json.dumps({'ok':True,'result':check_permissions(args.home)},ensure_ascii=False))
+        return
+    if args.command=='diagnose':
+        from switcher.diagnostics import diagnose_thread
+        print(json.dumps({'ok':True,'result':diagnose_thread(args.home,require(data,'id','会话 ID'))},ensure_ascii=False))
         return
     if args.command!='live-status':require_permissions(args.home)
     app=Switcher(args.home)
