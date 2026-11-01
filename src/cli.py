@@ -5,7 +5,7 @@ sys.dont_write_bytecode = True
 from switcher.core import Switcher
 from switcher.permissions import check_permissions, require_permissions, PermissionCheckError
 
-PAYLOAD_COMMANDS=['switch','restore','settings','save-key','bridge','diagnose','repair-formats','repair-deepseek','web-search']
+PAYLOAD_COMMANDS=['switch','restore','settings','save-key','bridge','diagnose','ignore-attention','repair-formats','repair-deepseek','web-search']
 
 
 def payload():
@@ -27,7 +27,7 @@ def require(data,name,what):
 def main():
     p=argparse.ArgumentParser()
     p.add_argument('--home')
-    p.add_argument('command',choices=['permissions','recovery-status','diagnose','status','startup','live-status','switch','backup','restore','cleanup','settings','save-key','bridge','repair','repair-formats','repair-deepseek','web-search'])
+    p.add_argument('command',choices=['permissions','recovery-status','diagnose','status','startup','live-status','switch','backup','restore','cleanup','settings','save-key','bridge','ignore-attention','clear-attention-ignores','repair','repair-formats','repair-deepseek','web-search'])
     args=p.parse_args()
     data=payload() if args.command in PAYLOAD_COMMANDS else {}
     # Permission reporting must work even when Switcher cannot create its data directory.
@@ -57,6 +57,8 @@ def main():
     elif args.command=='cleanup':result={'removed':len(app.cleanup())}
     elif args.command=='settings':result=app.save_settings(int(data.get('keep',0)),int(data.get('days',0)),data.get('auto_cleanup',True))
     elif args.command=='bridge':result=app.bridge(require(data,'id','会话 ID'))
+    elif args.command=='ignore-attention':result=app.ignore_attention(require(data,'id','会话 ID'))
+    elif args.command=='clear-attention-ignores':result=app.clear_attention_ignores()
     else:result=app.save_key(data.get('key',''))
     print(json.dumps({'ok':True,'result':result},ensure_ascii=False))
 

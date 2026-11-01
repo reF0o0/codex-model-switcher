@@ -251,39 +251,66 @@ class Switcher:
         self.config=self.home/'config.toml'
         self.pending=self.data/'pending.json'
         self.search_file=self.data/'search-state.json'
+        self.ignores_file=self.data/'attention-ignores.json'
+
+    def attention_ignores(self):
+        path=self.ignores_file
+        if path.is_symlink():raise ValueError('忽略记录不能是符号链接')
+        value=json.loads(path.read_text()) if path.exists() else []
+        if not isinstance(value,list) or not all(isinstance(v,str) and v for v in value):
+            raise ValueError('忽略记录格式无效')
+        return sorted(set(value))
+
+    def ignore_attention(self,ident):
+        if not isinstance(ident,str) or not ident:raise ValueError('没有收到要忽略的会话 ID')
+        with self.lock(closed=False):
+            values=self.attention_ignores()
+            if ident not in values:
+                values.append(ident)
+                atomic_write(self.ignores_file,json.dumps(sorted(values)).encode())
+            return {'ignored_attention':sorted(values)}
+
+    def clear_attention_ignores(self):
+        with self.lock(closed=False):
+            if self.ignores_file.exists():self.ignores_file.unlink()
+            sync_directory(self.data)
+            return {'ignored_attention':[]}
 
     def search_preferences(self):
         if self.search_file.is_symlink():raise ValueError('联网偏好文件不能是符号链接')
         value=json.loads(self.search_file.read_text()) if self.search_file.exists() else {}
         return validate_search_preferences(value)
 
-    def search_catalog(self,config,original=None):
-        """Read capability declarations; only update the two search fields of Pro."""
+    def search_catalog(self,config,original=None,model=None,force_default=False):
+        """Read or restore the current model's two search capability fields."""
         path=self.home/'models.json'
-        configured=Path(config.get('model_catalog_json') or path).expanduser()
+        configured=path if force_default else Path(config.get('model_catalog_json') or path).expanduser()
         if not configured.is_absolute():configured=self.home/configured
         if path.is_symlink() or configured.resolve()!=path.resolve():
             raise ValueError('搜索模型目录位于自定义路径或符号链接，无法安全自动修改')
+        slug=model or config.get('model')
+        if not isinstance(slug,str) or not slug:
+            raise ValueError('无法确认当前模型，未修改搜索声明')
         try:
             catalog=json.loads(path.read_text())
             models=catalog['models']
             if not isinstance(models,list) or not all(isinstance(m,dict) for m in models):raise ValueError()
-            matches=[m for m in models if m.get('slug')=='deepseek-v4-pro']
+            matches=[m for m in models if m.get('slug')==slug]
             if len(matches)!=1:raise ValueError()
-            pro=matches[0]
+            current=matches[0]
         except (ValueError,KeyError,TypeError,OSError):
-            raise ValueError('无法读取有效的 DeepSeek V4 Pro 模型目录，已停止修改') from None
-        ready=pro.get('supports_search_tool') is True and pro.get('web_search_tool_type')=='text'
-        before=dict(pro)
+            raise ValueError('模型目录无法确认 '+slug+' 的搜索能力，已停止修改') from None
+        ready=current.get('supports_search_tool') is True and current.get('web_search_tool_type')=='text'
+        before=dict(current)
         if original is None:
-            pro.update(supports_search_tool=True,web_search_tool_type='text')
+            current.update(supports_search_tool=True,web_search_tool_type='text')
         else:
-            originals=[m for m in original.get('models',[]) if m.get('slug')=='deepseek-v4-pro']
-            if len(originals)!=1:raise ValueError('备份中缺少可恢复的 Pro 搜索声明')
+            originals=[m for m in original.get('models',[]) if m.get('slug')==slug]
+            if len(originals)!=1:raise ValueError('备份中缺少可恢复的 '+slug+' 搜索声明')
             for key in ('supports_search_tool','web_search_tool_type'):
-                if key in originals[0]:pro[key]=originals[0][key]
-                else:pro.pop(key,None)
-        return ready,(json.dumps(catalog,ensure_ascii=False,indent=2)+'\n').encode() if pro!=before else None
+                if key in originals[0]:current[key]=originals[0][key]
+                else:current.pop(key,None)
+        return ready,(json.dumps(catalog,ensure_ascii=False,indent=2)+'\n').encode() if current!=before else None
 
     def runtime_status(self,config=None):
         config=tomllib.loads(self.config.read_text()) if config is None else config
@@ -293,7 +320,7 @@ class Switcher:
         desktop=desktop_state()
         mode=config.get('web_search','default')
         if mode not in (*SEARCH_MODES,'default'):mode='invalid'
-        supported=provider=='deepseek' and model=='deepseek-v4-pro'
+        supported=provider=='deepseek'
         catalog_ready=False
         catalog_error=False
         if supported:
@@ -305,8 +332,8 @@ class Switcher:
                'off' if mode=='disabled' else mode)
         descriptions={'inactive':'当前配置不是 DeepSeek',
                       'profile':'当前 profile 覆盖了模型或联网设置，请先处理配置档',
-                      'unsupported':'当前模型不支持官方内置搜索（仅 DeepSeek V4 Pro 支持）',
-                      'catalog':'联网配置已开启，但模型目录未声明支持；点开启可修复',
+                      'unsupported':'当前模型目录不支持官方内置搜索',
+                      'catalog':'模型目录尚未声明当前模型的搜索能力；点开启可修复',
                       'catalog-error':'无法确认模型目录的搜索支持，请检查 models.json',
                       'on':'已开启（live）','off':'已关闭',
                       'default':'未显式设置，尚不能确认已启用',
@@ -328,8 +355,6 @@ class Switcher:
             _,profile=profile_config(config)
             if profile:raise ValueError('当前 profile 覆盖了设置，请先取消或修改该配置档')
             if logical_provider(config)!='deepseek':raise ValueError('请先切到 DeepSeek，再操作此联网开关')
-            if enabled and config.get('model')!='deepseek-v4-pro':
-                raise ValueError('官方内置搜索仅支持 DeepSeek V4 Pro；Flash 可继续通过外部工具联网')
             mode='live' if enabled else 'disabled'
             _,catalog=self.search_catalog(config) if enabled else (False,None)
             if config.get('web_search')==mode and catalog is None:
@@ -337,7 +362,7 @@ class Switcher:
             preferences=self.search_preferences()
             preferences['deepseek']=mode
             text=rewrite_config(text,{'web_search':mode})
-            snapshot=self.snapshot(manage_search_catalog=catalog is not None)
+            snapshot=self.snapshot(manage_search_catalog=config.get('model') if catalog is not None else False)
             self._apply(text,[],snapshot['id'],[],search_state=preferences,catalog=catalog)
             removed=self._cleanup() if self.settings()['auto_cleanup'] else []
             return {'backup_id':snapshot['id'],'removed':len(removed),
@@ -419,7 +444,10 @@ class Switcher:
             manifest=self.store.create(files,self.routes())
             journal_changes=file_changes if file_changes is not None else compatibility
             if compatibility or journal_changes or manage_search_catalog:
-                if manage_search_catalog:manifest['search_catalog_managed']=True
+                if manage_search_catalog:
+                    manifest['search_catalog_managed']=True
+                    manifest['search_catalog_model']=(manage_search_catalog
+                                                      if isinstance(manage_search_catalog,str) else None)
                 if compatibility:
                     manifest['compatibility']={str(p.relative_to(self.home)):describe(changes)
                                                for p,changes in compatibility.items()}
@@ -812,7 +840,9 @@ class Switcher:
             compatibility=self.compatibility_restore(repair_manifest)
             catalog=None
             if original.get('search_catalog_managed'):
-                _,catalog=self.search_catalog({},json.loads(self.store.content(ident,'models.json')))
+                _,catalog=self.search_catalog(config,json.loads(self.store.content(ident,'models.json')),
+                                              model=original.get('search_catalog_model') or 'deepseek-v4-pro',
+                                              force_default=True)
             saved_config=None
             if rebuilt and damaged is not None:
                 recovery=self.data/'config-recovery'
@@ -1099,6 +1129,7 @@ class Switcher:
         last_switch=read_json(self.data/'last-switch.json',None)
         if last_switch and (last_switch.get('provider')!=logical or last_switch.get('model')!=live['model']):last_switch=None
         return {**live,'threads':threads,'last_switch':last_switch,
+                'ignored_attention':self.attention_ignores(),
                 'backups':[{'id':s['id'],'created_at':s['created_at'],'files':len(s['files'])} for s in snapshots],
                 'settings':self.settings(),
                 'pending':json.loads(self.pending.read_text()) if self.pending.exists() else None,
