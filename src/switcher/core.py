@@ -29,7 +29,13 @@ MANAGED = ('model_provider', 'model', 'model_reasoning_effort', 'model_catalog_j
 MODELS = {'openai': ['gpt-6.1-sol','gpt-6-sol','gpt-6-luna','gpt-6-astra'],
           'deepseek': ['deepseek-flash','deepseek-v4-pro']}
 SECRET_LINE = re.compile(r'^\s*(experimental_bearer_token|api_key)\s*=')
-SEARCH_MODES = ('live','cached','disabled')
+SEARCH_MODES = ('live','cached','indexed','disabled')
+
+
+def native_search_supported(provider,model):
+    # DeepSeek's Responses API ignores web_search for Flash, even if the local
+    # catalog advertises it. Keep the server limit separate from catalog readiness.
+    return provider=='openai' or (provider=='deepseek' and model=='deepseek-v4-pro')
 
 
 def validate_search_preferences(value):
@@ -407,31 +413,32 @@ class Switcher:
         desktop=desktop_state()
         mode=config.get('web_search','default')
         if mode not in (*SEARCH_MODES,'default'):mode='invalid'
-        supported=provider=='deepseek'
+        supported=native_search_supported(provider,model)
         catalog_ready=False
         catalog_error=False
-        if supported:
+        if provider=='deepseek' and supported:
             try:catalog_ready,_=self.search_catalog(config)
             except (ValueError,OSError):catalog_error=True
-        state=('inactive' if provider!='deepseek' else 'profile' if profile else
+        state=('inactive' if provider not in MODELS else 'profile' if profile else
                'unsupported' if not supported else 'catalog-error' if catalog_error else
-               'catalog' if mode=='live' and not catalog_ready else 'on' if mode=='live' else
+               'catalog' if provider=='deepseek' and mode=='live' and not catalog_ready else 'on' if mode=='live' else
                'off' if mode=='disabled' else mode)
-        descriptions={'inactive':'当前配置不是 DeepSeek',
+        descriptions={'inactive':'当前服务商不支持本工具的内置搜索开关',
                       'profile':'当前 profile 覆盖了模型或联网设置，请先处理配置档',
-                      'unsupported':'当前模型目录不支持官方内置搜索',
+                      'unsupported':'当前 DeepSeek 模型暂不支持内置搜索；请使用 V4 Pro（搜索偏好保留）',
                       'catalog':'模型目录尚未声明当前模型的搜索能力；点开启可修复',
                       'catalog-error':'无法确认模型目录的搜索支持，请检查 models.json',
                       'on':'已开启（live）','off':'已关闭',
                       'default':'未显式设置，尚不能确认已启用',
                       'cached':'已配置缓存搜索，非 live 模式',
+                      'indexed':'已配置索引限定的联网搜索，非 live 模式',
                       'invalid':'联网配置无效，未修改任何设置'}
         return {'provider':provider,'model':model,'effort':config.get('model_reasoning_effort','默认'),
                 'desktop_running':desktop=='running','desktop_check':desktop,
                 'pending_operation':self.pending.exists(),'checked_at':time.time(),
                 'web_search':{'state':state,'mode':mode,'supported':supported,
                               'can_enable':supported and not profile and not catalog_error,
-                              'can_disable':provider=='deepseek' and mode in ('live','cached') and not profile,
+                              'can_disable':provider in MODELS and mode in ('live','cached','indexed') and not profile,
                               'requires_restart':desktop!='stopped','description':descriptions[state]}}
 
     def set_web_search(self,enabled):
@@ -441,19 +448,22 @@ class Switcher:
             config=tomllib.loads(text)
             _,profile=profile_config(config)
             if profile:raise ValueError('当前 profile 覆盖了设置，请先取消或修改该配置档')
-            if logical_provider(config)!='deepseek':raise ValueError('请先切到 DeepSeek，再操作此联网开关')
+            provider=logical_provider(config)
+            if provider not in MODELS:raise ValueError('此开关仅支持 GPT 和 DeepSeek')
+            if enabled and not native_search_supported(provider,config.get('model')):
+                raise ValueError('当前 DeepSeek 模型暂不支持内置搜索，请切换到 V4 Pro')
             mode='live' if enabled else 'disabled'
-            _,catalog=self.search_catalog(config) if enabled else (False,None)
-            if config.get('web_search')==mode and catalog is None:
-                return {'message':'联网配置已经'+('开启' if enabled else '关闭')+'，无需修改。'}
+            _,catalog=self.search_catalog(config) if enabled and provider=='deepseek' else (False,None)
             preferences=self.search_preferences(strict=True)
-            preferences['deepseek']=mode
+            if config.get('web_search')==mode and catalog is None and preferences.get(provider)==mode:
+                return {'message':'联网配置已经'+('开启' if enabled else '关闭')+'，无需修改。'}
+            preferences[provider]=mode
             text=rewrite_config(text,{'web_search':mode})
             snapshot=self.snapshot(manage_search_catalog=config.get('model') if catalog is not None else False)
             self._apply(text,[],snapshot['id'],[],search_state=preferences,catalog=catalog)
             removed=self._cleanup() if self.settings()['auto_cleanup'] else []
             return {'backup_id':snapshot['id'],'removed':len(removed),
-                    'message':'DeepSeek 官方内置搜索已'+('开启' if enabled else '关闭')+
+                    'message':('DeepSeek' if provider=='deepseek' else 'GPT')+' 内置网页搜索已'+('开启' if enabled else '关闭')+
                               '；重新打开 ChatGPT/Codex 后使用。此开关不控制 MCP、浏览器或其他联网工具。'}
 
     def settings(self,warnings=None):
@@ -906,13 +916,11 @@ class Switcher:
             current_mode=cfg.get('web_search')
             if current_mode is not None and current_mode not in SEARCH_MODES:
                 raise ValueError('当前联网配置无效，已停止切换')
-            if current=='openai' or (current=='deepseek' and cfg.get('model')=='deepseek-v4-pro'):
+            if native_search_supported(current,cfg.get('model')) and current_mode is not None:
                 search_state[current]=current_mode
             values={k:None for k in MANAGED}
             values.update(model_provider=provider,model=model,model_reasoning_effort=effort)
-            if provider=='deepseek':
-                values['web_search']=(search_state.get('deepseek') or 'disabled') if model=='deepseek-v4-pro' else 'disabled'
-            else:values['web_search']=search_state.get('openai')
+            values['web_search']=(search_state.get(provider) or 'live') if native_search_supported(provider,model) else 'disabled'
             stored_provider='ds_api' if provider=='deepseek' else provider
             values['model_provider']=stored_provider
             if provider=='deepseek':
@@ -926,7 +934,7 @@ class Switcher:
                 text=provider_auth_config(text)
             text=rewrite_config(text,values)
             catalog=None
-            if provider=='deepseek' and model=='deepseek-v4-pro' and values['web_search']=='live':
+            if provider=='deepseek' and values['web_search']=='live':
                 _,catalog=self.search_catalog(tomllib.loads(text))
             routes=self.switch_routes(days)
             # Other custom providers remain untouched; only the user's GPT/DeepSeek groups migrate.
@@ -954,7 +962,7 @@ class Switcher:
             # Both directions need an operation journal; only GPT repairs need
             # long-term protection of original DeepSeek reasoning.
             snapshot=self.snapshot(compatibility if provider=='openai' else None,
-                                   file_changes=compatibility,manage_search_catalog=catalog is not None)
+                                   file_changes=compatibility,manage_search_catalog=model if catalog is not None else False)
             self._apply(text,updated,snapshot['id'],updates,compatibility=compatibility,search_state=search_state,catalog=catalog)
             removed=self._cleanup() if self.settings()['auto_cleanup'] else []
             if provider=='openai':
@@ -1020,9 +1028,10 @@ class Switcher:
                     repair_manifest=self.store.verify(pending['compatibility_backup_id'])
             compatibility=self.compatibility_restore(repair_manifest)
             catalog=None
+            catalog_model=original.get('search_catalog_model') or 'deepseek-v4-pro'
             if original.get('search_catalog_managed'):
                 _,catalog=self.search_catalog(config,json.loads(self.store.content(ident,'models.json')),
-                                              model=original.get('search_catalog_model') or 'deepseek-v4-pro',
+                                              model=catalog_model,
                                               force_default=True)
             saved_config=None
             if rebuilt and damaged is not None:
@@ -1033,7 +1042,7 @@ class Switcher:
                 saved_config=recovery/(str(uuid.uuid4())+'.toml')
                 atomic_write(saved_config,damaged)
             # New threads and all message history are deliberately left in place.
-            safety=self.snapshot(file_changes=compatibility,manage_search_catalog=catalog is not None,skip_config=rebuilt)
+            safety=self.snapshot(file_changes=compatibility,manage_search_catalog=catalog_model if catalog is not None else False,skip_config=rebuilt)
             self._apply(text,routes,safety['id'],updates,recovery_id=ident,compatibility=compatibility,search_state=search_state,catalog=catalog)
             removed=self._cleanup() if self.settings()['auto_cleanup'] else []
             return {'restored':ident,'backup_id':safety['id'],'removed':len(removed),

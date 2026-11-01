@@ -1,6 +1,6 @@
 # Codex 模型切换器
 
-更新授权说明：本机 1.6.4 使用固定本地签名，更新时会校验同一身份并保留授权记录，减少版本更新后再次授权。见 [更新授权与一次性设置](docs/signing.md)。
+更新授权说明：本机 1.7.0 使用固定本地签名，更新时会校验同一身份并保留授权记录，减少版本更新后再次授权。见 [更新授权与一次性设置](docs/signing.md)。
 
 <img src="assets/AppIcon.png" width="128" alt="Codex 模型切换器图标">
 
@@ -29,13 +29,13 @@
 - **只修复不切换**：Codex 重新扫描导致路由错位时，按当前模型重新对齐会话文件和数据库，不改变模型。
 - **切回 DeepSeek 自动还原**：切到 DeepSeek 时把之前修复过的推理区段还原成原始记录，保留后来追加的消息。
 - **单独修复 DeepSeek 历史**：保持当前模型，还原本工具保存的原始推理并对齐路由；冲突会话跳过，未知损坏不强行修复。
-- **DeepSeek 官方联网开关**：Pro 可开启，Flash 显示不支持；两家模型分别保存偏好，开启前备份并检查模型目录声明。
+- **内置网页搜索开关**：GPT 与 DeepSeek V4 Pro 默认开启，分别保存手动选择；Flash 明确显示暂不支持。开启前备份，DeepSeek Pro 同时检查模型目录声明。
 - **当前配置状态**：手动轻量刷新服务商、模型、联网配置和客户端进程状态，显示最近检查时间，左上角图标跟随读取到的当前配置。
 - **ChatGPT 登录保留**：DeepSeek 用自己的 API key，不拿它覆盖 ChatGPT 的登录凭据。
 
 ## 安装
 
-1  从 [Releases 页面](https://github.com/reF0o0/codex-model-switcher/releases)下载当前版本的 `Codex-Model-Switcher-v1.6.4.zip`（或最新 Release 中的 zip）。
+1  从 [Releases 页面](https://github.com/reF0o0/codex-model-switcher/releases)下载所需版本中的 zip。本机更新可能早于公开 Release。
 
 2  解压，把「Codex 模型切换器.app」拖到「应用程序」文件夹，双击打开。
 
@@ -45,7 +45,7 @@
 
 目前提供 Apple Silicon 构建。Release 使用本机固定证书签名，尚未做 Apple 开发者签名和公证；Release 同时提供 SHA-256 校验文件。
 
-本机 1.6.4 使用固定本地证书签名，后续构建和安装沿用同一身份，减少更新后重新授权的问题；此证书只用于本人的这台 Mac，不作为公开分发方案。具体规则见 [更新授权与签名](docs/signing.md)。其他 Mac 首次打开时可能需要在“隐私与安全性”中手动允许。
+本机 1.7.0 使用固定本地证书签名，后续构建和安装沿用同一身份，减少更新后重新授权的问题；此证书只用于本人的这台 Mac，不作为公开分发方案。具体规则见 [更新授权与签名](docs/signing.md)。其他 Mac 首次打开时可能需要在“隐私与安全性”中手动允许。
 
 ## 使用
 
@@ -118,11 +118,11 @@
 
 此入口不是任意损坏修复器：没有原始备份的推理、丢失的调用配对和未知格式无法凭空补出。缺少本机文件的会话明确列为未检查正文。
 
-### DeepSeek 联网开关与状态检查
+### 内置网页搜索开关与状态检查
 
-切换页显示当前模型的 DeepSeek 官方内置搜索状态。是否支持以本机 `models.json` 中当前模型的 `supports_search_tool` / `web_search_tool_type` 声明为准，不再写死 V4 Pro；`deepseek-flash` 声明支持时可直接开启。需要先退出 ChatGPT/Codex，按钮会先备份，并只修正当前模型的搜索声明。
+切换页显示当前 GPT 或 DeepSeek 模型的内置网页搜索配置。没有显式偏好时，GPT 和 DeepSeek V4 Pro 默认使用 `live`；之后分别记住手动选择。先退出 ChatGPT/Codex，刷新状态，再点开启或关闭；工具先创建可恢复的备份，DeepSeek Pro 开启时仅修正当前模型目录中的搜索字段。
 
-此开关不控制 MCP、浏览器、Agent Reach 等外部联网工具。GPT 与 DeepSeek 的联网偏好分别保存，切换到 Flash 会暂停内置搜索，回到 Pro 后可恢复此前偏好；日常恢复也包含联网配置和本工具改动的搜索声明，不覆盖模型目录的其他改动。
+DeepSeek 官方 [Responses API](https://api-docs.deepseek.com/zh-cn/guides/responses_api/#tools) 当前只在 Pro 下执行内置 `web_search`，Flash 会忽略请求，即使本机目录声明支持也不能据此启用。切经 Flash 暂停内置搜索，回到 Pro 后恢复偏好。Flash 可结合独立 [Search/Fetch API](https://api-docs.deepseek.com/zh-cn/guides/search/) 联网，但需要另外接入工具。本开关不控制这些独立接口、MCP、浏览器或 Agent Reach。恢复包含联网设置和本工具改动的搜索字段，不覆盖模型目录的其他改动。
 
 状态仅在启动、操作完成或手动点「刷新／刷新状态」时读取，显示最近检查时间，不自动轮询。状态读取不发送搜索或模型请求，单独「刷新状态」也不扫描全部历史。它不是运行中会话的遥测：客户端启动参数、会话级设置可能覆盖磁盘配置，无法确认运行中的客户端是否已经载入；修改前须退出并刷新，保存后重新打开。读取失败时会提示值可能过期并暂停写入。存在活动 profile 覆盖时，先处理该配置档。
 

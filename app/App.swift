@@ -371,7 +371,7 @@ final class AppModel: ObservableObject {
     var canWrite: Bool {canManageFiles && desktopCheck == "stopped" && live?.pending_operation == false}
     var canRecover: Bool {!busy && !checkingAccess && fileAccess?.canRestore == true && recovery?.desktop_check == "stopped"}
     var canRecoverDatabase: Bool {canRecover}
-    var enableSearch: Bool {live?.web_search.state == "catalog" || !["live","cached"].contains(live?.web_search.mode ?? "")}
+    var enableSearch: Bool {live?.web_search.state == "catalog" || !["live","cached","indexed"].contains(live?.web_search.mode ?? "")}
     var providerName: String {
         switch live?.provider {case "deepseek":return "DeepSeek";case "openai":return "GPT";default:return "当前服务商"}
     }
@@ -926,10 +926,10 @@ struct ContentView: View {
             }
             Button("取消",role:.cancel) {}
         } message: {Text("保留当前 DeepSeek 模型和推理强度。只还原本工具备份过的原始推理区段并对齐路由；冲突会话跳过。未知损坏或缺失的原始推理不能凭空修复。")}
-        .confirmationDialog(app.enableSearch ? "开启 DeepSeek 官方内置搜索？" : "关闭 DeepSeek 官方内置搜索？",isPresented:$app.confirmSearch,titleVisibility:.visible) {
+        .confirmationDialog(app.enableSearch ? "开启 \(app.providerName) 内置网页搜索？" : "关闭 \(app.providerName) 内置网页搜索？",isPresented:$app.confirmSearch,titleVisibility:.visible) {
             Button(app.enableSearch ? "备份并开启" : "备份并关闭") {app.run("web-search",["enabled":app.enableSearch])}
             Button("取消",role:.cancel) {}
-        } message: {Text("只控制当前 DeepSeek 模型的官方内置搜索，是否可用以模型目录声明为准。搜索与模型调用可能产生费用。MCP、浏览器等外部联网工具不受影响。先退出 ChatGPT/Codex，保存后重新打开。")}
+        } message: {Text("只控制当前服务商的内置网页搜索，GPT 与 DeepSeek 分别记住选择。DeepSeek 是否可用还取决于模型及服务端支持。搜索与模型调用可能产生费用。MCP、浏览器等外部联网工具不受影响。先退出 ChatGPT/Codex，保存后重新打开。")}
     }
 
     var fileAccessView: some View {
@@ -1017,15 +1017,15 @@ struct ContentView: View {
                 Text("更早的会话不会随切换迁移；需要对齐全部旧会话时，使用下方“维护工具 → 只修复路由”。")
                     .font(.caption).foregroundStyle(.secondary)
 
-                if app.live?.provider == "deepseek" {
+                if ["openai","deepseek"].contains(app.live?.provider ?? "") {
                     HStack {
-                        Label(app.live?.web_search.description ?? "正在读取搜索状态……",systemImage:"network")
+                        Label("\(app.providerName) 内置网页搜索：\(app.live?.web_search.description ?? "正在读取搜索状态……")",systemImage:"network")
                             .foregroundStyle(app.live?.web_search.state == "on" ? .green : .secondary)
                         Spacer()
                         Button(app.enableSearch ? "开启搜索" : "关闭搜索") {app.confirmSearch=true}
                             .disabled(!app.canWrite || (app.enableSearch ? app.live?.web_search.can_enable != true : app.live?.web_search.can_disable != true))
                     }
-                    Text("官方内置搜索按 models.json 的模型能力启用；Flash 和 V4 Pro 均可由声明决定。")
+                    Text("GPT 与 DeepSeek V4 Pro 默认开启，分别记住选择；Flash 暂不支持。当前开关对应 \(app.providerName)。")
                         .font(.caption).foregroundStyle(.secondary)
                 }
 

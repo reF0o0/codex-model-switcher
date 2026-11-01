@@ -2,6 +2,16 @@
 
 更新日期：2026-10-19（Asia/Shanghai）。运行环境：Apple Silicon Mac，macOS 26.7.1，Python 3.13，Codex 0.162.0-alpha.17.2。
 
+## v1.7.0 内置网页搜索 · 2026-11-01
+
+- 后端 182 项测试通过；新旧回归覆盖 GPT 搜索开关、默认 live、两家独立偏好、Flash 往返后保留 Pro 选择、纠正过期偏好、配置及目录字段恢复和恢复操作撤销。
+- 生产 Swift AppModel 在临时应用包、合成数据和假钥匙串中通过 GPT/Pro 默认值、开关经 CLI 保存并刷新、运行中客户端拦截、两家偏好隔离、Flash 服务端限制及原有应急恢复检查。未使用真实会话测试写入。
+- release 优化构建、固定身份签名及严格签名校验通过。通过安装脚本更新到 /Applications 中的 1.7.0，与旧版签名身份一致；旧版保留在 Previous Apps，既有设置保留。
+- 已安装原生窗口的辅助功能树显示“GPT 内置网页搜索：已开启（live）”与“关闭搜索”按钮；客户端运行时按钮禁用。新增入口已显示，未对正在运行的真实 Codex 执行搜索切换或模型切换。
+- 按用户要求，将切换器保存的 GPT 和 DeepSeek 搜索偏好设为 live；验证当前 config.toml 和 models.json 字节未改变。当前 GPT 全局配置本来已是 live。
+- 对照 DeepSeek 官方中文 Search/Fetch、Responses API 和 Codex 接入文档：独立 Search/Fetch API 无模型参数，可结合 Flash 使用；Responses 内置 web_search 仅 Pro 执行，Flash 忽略。实现及界面按此区别处理，未发送额外的付费搜索或模型请求。
+- git diff --check 和构建脚本语法检查通过。本机更新未提交或公开发布。
+
 ## v1.6.4 许可证与首次启动同意
 
 - 仓库根目录新增 MIT `LICENSE` 和 `TERMS.md`；构建时把 `TERMS.md` 放进应用资源，离线可读。

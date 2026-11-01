@@ -36,41 +36,66 @@ class SearchControlTests(CodexHomeFixture):
         self.app.set_web_search(False)
         self.assertEqual(self.config()['web_search'],'disabled')
 
-    def test_flash_declared_search_support_can_be_enabled(self):
+    def test_flash_catalog_cannot_override_official_server_limit(self):
         self.configure(model='deepseek-flash')
         catalog=json.loads((self.home/'models.json').read_text())
         next(m for m in catalog['models'] if m['slug']=='deepseek-flash').update(
             supports_search_tool=True,web_search_tool_type='text')
         (self.home/'models.json').write_text(json.dumps(catalog))
         status=self.app.runtime_status()['web_search']
-        self.assertTrue(status['supported'])
-        self.assertTrue(status['can_enable'])
-        self.app.set_web_search(True)
-        self.assertEqual(self.config()['web_search'],'live')
-        self.assertEqual(self.app.runtime_status()['web_search']['state'],'on')
+        self.assertFalse(status['supported'])
+        self.assertFalse(status['can_enable'])
+        self.assertEqual(status['state'],'unsupported')
+        with self.assertRaisesRegex(ValueError,'V4 Pro'):self.app.set_web_search(True)
+        self.assertNotIn('web_search',self.config())
+        self.assertEqual(self.app.store.list(),[])
 
-    def test_flash_missing_catalog_declaration_is_repaired_for_that_model(self):
+    def test_flash_missing_catalog_declaration_is_not_fabricated(self):
         self.configure(model='deepseek-flash')
         catalog=json.loads((self.home/'models.json').read_text())
         next(m for m in catalog['models'] if m['slug']=='deepseek-flash').update(
             supports_search_tool=False)
         (self.home/'models.json').write_text(json.dumps(catalog))
-        self.app.set_web_search(True)
-        self.assertEqual(self.config()['web_search'],'live')
+        before=(self.home/'models.json').read_bytes()
+        with self.assertRaises(ValueError):self.app.set_web_search(True)
         flash=next(m for m in json.loads((self.home/'models.json').read_text())['models']
                    if m['slug']=='deepseek-flash')
-        self.assertTrue(flash['supports_search_tool'])
+        self.assertFalse(flash['supports_search_tool'])
+        self.assertEqual((self.home/'models.json').read_bytes(),before)
 
     def test_existing_live_flash_config_can_be_disabled(self):
         self.configure(model='deepseek-flash',mode='live')
         self.app.set_web_search(False)
         self.assertEqual(self.config()['web_search'],'disabled')
 
-    def test_gpt_toggle_rejected_without_mutation(self):
+    def test_gpt_toggle_preserves_catalog_routes_and_auth(self):
         self.configure(provider='openai',model='gpt-6.1-sol',mode='live')
+        catalog=(self.home/'models.json').read_bytes()
+        auth=(self.home/'auth.json').read_bytes()
+        routes=self.app.routes()
+        self.app.set_web_search(False)
+        self.assertEqual(self.config()['web_search'],'disabled')
+        self.assertEqual(self.app.search_preferences()['openai'],'disabled')
+        self.app.set_web_search(True)
+        self.assertEqual(self.config()['web_search'],'live')
+        self.assertEqual(self.app.search_preferences()['openai'],'live')
+        self.assertEqual((self.home/'models.json').read_bytes(),catalog)
+        self.assertEqual((self.home/'auth.json').read_bytes(),auth)
+        self.assertEqual(self.app.routes(),routes)
+        self.assertEqual((self.home/'sessions/one.jsonl').read_bytes(),self.original)
+
+    def test_gpt_toggle_does_not_require_deepseek_catalog(self):
+        self.configure(provider='openai',model='gpt-6.1-sol',mode='disabled')
+        (self.home/'models.json').unlink()
+        self.app.set_web_search(True)
+        status=self.app.runtime_status()['web_search']
+        self.assertEqual(status['state'],'on')
+        self.assertTrue(status['can_disable'])
+
+    def test_unknown_provider_toggle_rejected_without_mutation(self):
+        self.configure(provider='other',model='other-model')
         before=(self.home/'config.toml').read_bytes()
-        with self.assertRaisesRegex(ValueError,'DeepSeek'):
-            self.app.set_web_search(False)
+        with self.assertRaises(ValueError):self.app.set_web_search(True)
         self.assertEqual((self.home/'config.toml').read_bytes(),before)
         self.assertEqual(self.app.store.list(),[])
 
@@ -82,26 +107,74 @@ class SearchControlTests(CodexHomeFixture):
     def test_repeated_toggle_is_noop(self):
         self.configure(mode='live')
         self.app.set_web_search(True)
-        self.assertEqual(self.app.store.list(),[])
+        count=len(self.app.store.list())
+        self.app.set_web_search(True)
+        self.assertEqual(len(self.app.store.list()),count)
+
+    def test_gpt_toggle_updates_stale_saved_preference_even_when_config_matches(self):
+        self.configure(provider='openai',model='gpt-6.1-sol',mode='live')
+        self.app.search_file.write_text('{"openai":"disabled","deepseek":"disabled"}')
+        self.app.set_web_search(True)
+        self.assertEqual(self.app.search_preferences(),{'openai':'live','deepseek':'disabled'})
+
+    def test_gpt_and_pro_default_to_live_with_flash_suspended(self):
+        self.configure(provider='openai',model='gpt-6.1-sol')
+        self.app.switch('deepseek','deepseek-flash')
+        self.assertEqual(self.config()['web_search'],'disabled')
+        self.assertEqual(self.app.runtime_status()['web_search']['state'],'unsupported')
+        self.app.switch('deepseek','deepseek-v4-pro')
+        self.assertEqual(self.config()['web_search'],'live')
+        self.assertEqual(self.app.runtime_status()['web_search']['state'],'on')
+        self.app.switch('openai','gpt-6.1-sol')
+        self.assertEqual(self.config()['web_search'],'live')
 
     def test_provider_preferences_survive_roundtrip_and_flash_visit(self):
         self.configure(provider='openai',model='gpt-6.1-sol',mode='cached')
         self.app.switch('deepseek','deepseek-v4-pro')
-        self.assertEqual(self.config()['web_search'],'disabled')
-        self.app.set_web_search(True)
+        self.assertEqual(self.config()['web_search'],'live')
+        self.app.set_web_search(False)
         self.app.switch('openai','gpt-6.1-sol')
         self.assertEqual(self.config()['web_search'],'cached')
         self.app.switch('deepseek','deepseek-flash')
         self.assertEqual(self.config()['web_search'],'disabled')
         self.app.switch('deepseek','deepseek-v4-pro')
+        self.assertEqual(self.config()['web_search'],'disabled')
+        self.app.set_web_search(True)
+        self.app.switch('deepseek','deepseek-flash')
+        self.assertEqual(self.config()['web_search'],'disabled')
+        self.app.switch('deepseek','deepseek-v4-pro')
         self.assertEqual(self.config()['web_search'],'live')
 
-    def test_gpt_implicit_default_is_restored_as_missing_key(self):
+    def test_gpt_implicit_default_becomes_live_on_switch(self):
         self.configure(provider='openai',model='gpt-6.1-sol')
         self.app.switch('deepseek','deepseek-v4-pro')
         self.app.set_web_search(True)
         self.app.switch('openai','gpt-6.1-sol')
-        self.assertNotIn('web_search',self.config())
+        self.assertEqual(self.config()['web_search'],'live')
+
+    def test_gpt_explicit_off_survives_deepseek_roundtrip(self):
+        self.configure(provider='openai',model='gpt-6.1-sol',mode='live')
+        self.app.set_web_search(False)
+        result=self.app.switch('deepseek','deepseek-v4-pro')
+        self.assertEqual(self.config()['web_search'],'live')
+        self.app.switch('openai','gpt-6.1-sol')
+        self.assertEqual(self.config()['web_search'],'disabled')
+        self.app.restore(result['backup_id'])
+        self.assertEqual(self.config()['web_search'],'disabled')
+
+    def test_default_pro_search_catalog_is_restored_and_restore_can_be_undone(self):
+        self.configure(provider='openai',model='gpt-6.1-sol',mode='live')
+        catalog=json.loads((self.home/'models.json').read_text())
+        catalog['models'][1]['supports_search_tool']=False
+        (self.home/'models.json').write_text(json.dumps(catalog))
+        original=(self.home/'models.json').read_bytes()
+        result=self.app.switch('deepseek','deepseek-v4-pro')
+        enabled=json.loads((self.home/'models.json').read_text())
+        self.assertTrue(enabled['models'][1]['supports_search_tool'])
+        restored=self.app.restore(result['backup_id'])
+        self.assertEqual(json.loads((self.home/'models.json').read_text()),json.loads(original))
+        self.app.restore(restored['backup_id'])
+        self.assertEqual(json.loads((self.home/'models.json').read_text()),enabled)
 
     def test_restore_recovers_search_mode_and_saved_preference(self):
         self.configure(mode='disabled')
@@ -153,17 +226,18 @@ class SearchControlTests(CodexHomeFixture):
         self.assertTrue(status['web_search']['requires_restart'])
         self.assertNotIn('test-secret',json.dumps(status))
 
-    def test_status_tracks_external_changes_and_catalog_support_without_hardcoded_model(self):
+    def test_status_tracks_external_changes_and_official_model_support(self):
         self.configure(mode='live')
         self.assertEqual(self.app.runtime_status()['web_search']['state'],'on')
         self.configure(model='deepseek-flash',mode='live')
         status=self.app.runtime_status()
-        self.assertEqual(status['web_search']['state'],'catalog')
-        self.assertTrue(status['web_search']['can_enable'])
+        self.assertEqual(status['web_search']['state'],'unsupported')
+        self.assertFalse(status['web_search']['can_enable'])
         self.assertTrue(status['web_search']['can_disable'])
         self.configure(provider='openai',model='gpt-6.1-sol')
         self.assertEqual(self.app.runtime_status()['provider'],'openai')
-        self.assertEqual(self.app.runtime_status()['web_search']['state'],'inactive')
+        self.assertEqual(self.app.runtime_status()['web_search']['state'],'default')
+        self.assertTrue(self.app.runtime_status()['web_search']['can_enable'])
 
     def test_active_profile_cannot_be_silently_overridden_by_toggle(self):
         self.configure()
