@@ -106,6 +106,16 @@ def configured_key(provider):
     return value if isinstance(value,str) and value.strip() and value not in ('removed','<stored-in-keychain>') else None
 
 
+def configuration_backups(store):
+    """Only offer snapshots with a verified, parseable configuration for restoration."""
+    result=[]
+    for entry in store.list():
+        try:tomllib.loads(store.content(entry['id'],'config.toml').decode())
+        except (ValueError,OSError,KeyError,EOFError):continue
+        result.append(entry)
+    return result
+
+
 def set_deepseek_key(text,key):
     """Update (or create) the canonical DeepSeek provider and its auth alias."""
     lines=text.splitlines(keepends=True)
@@ -207,6 +217,26 @@ def replace_header(path, header):
 
 
 class Switcher:
+    @staticmethod
+    def recovery_status(home=None):
+        home = Path(home or Path.home()/'.codex').expanduser().absolute()
+        config = home/'config.toml'
+        if home.is_symlink() or config.is_symlink():raise ValueError('配置路径不能是符号链接')
+        try:
+            tomllib.loads(config.read_text())
+            state = 'ready'
+        except FileNotFoundError:state = 'missing'
+        except (ValueError, UnicodeError):state = 'invalid'
+        except OSError:state = 'unreadable'
+        backups = []
+        root = home/'provider-switcher/backups'
+        if root.exists() or root.is_symlink():
+            store = BackupStore.existing(root)
+            for entry in configuration_backups(store):
+                backups.append({'id':entry['id'], 'created_at':entry['created_at'], 'files':len(entry['files'])})
+        return {'config_state':state, 'backups':backups, 'desktop_check':desktop_state(),
+                'checked_at':time.time()}
+
     def __init__(self, home=None, require_closed=True, keychain=None):
         self.home=Path(home or Path.home()/'.codex').expanduser().resolve()
         self.require_closed=require_closed
@@ -353,9 +383,10 @@ class Switcher:
         with self.connect(True) as con:
             return [dict(r) for r in con.execute('select id,model_provider,model,reasoning_effort from threads')]
 
-    def snapshot(self,compatibility=None,file_changes=None,manage_search_catalog=False):
+    def snapshot(self,compatibility=None,file_changes=None,manage_search_catalog=False,skip_config=False):
         files={'provider-switcher/search-state.json':json.dumps(self.search_preferences()).encode()}
         for name in ['config.toml','models.json']:
+            if name=='config.toml' and skip_config:continue
             path=self.home/name
             if path.is_file():
                 files[name]=redact_config(path.read_text()).encode() if name=='config.toml' else path
@@ -409,6 +440,9 @@ class Switcher:
             journal=json.loads(self.pending.read_text())
             protected=[journal[k] for k in ['backup_id','safety_backup_id','compatibility_backup_id'] if k in journal]
         protected+=self.repair_backups()
+        # Recovery safety snapshots may have no usable config. They must not
+        # displace the last three actual configuration recovery points.
+        protected += [entry['id'] for entry in configuration_backups(self.store)[:3]]
         return self.store.prune(settings['keep'],settings['days'],protected=protected)
 
     def backup(self):
@@ -606,7 +640,7 @@ class Switcher:
     def _apply(self,text,routes,backup_id,updates,recovery_id=None,compatibility=None,search_state=None,catalog=None):
         if self.require_closed and desktop_state()!='stopped':
             raise ValueError('备份后无法确认 Codex 已退出，已停止写入。请退出并重试。')
-        before=self.config.read_bytes()
+        before=self.config.read_bytes() if self.config.exists() else None
         before_search=self.search_file.read_bytes() if self.search_file.exists() else None
         before_catalog=(self.home/'models.json').read_bytes() if catalog is not None else None
         previous=json.loads(self.pending.read_text()) if self.pending.exists() else {}
@@ -643,7 +677,10 @@ class Switcher:
                         if current==change.after:inverse.append(change.reverse())
                         elif current!=change.before:raise ValueError('会话已变化，请从备份恢复未完成的操作')
                 if inverse:replace_ranges(path,inverse)
-            atomic_write(self.config,before)
+            if before is None:
+                self.config.unlink(missing_ok=True)
+                sync_directory(self.home)
+            else:atomic_write(self.config,before)
             if before_catalog is not None:atomic_write(self.home/'models.json',before_catalog)
             if search_state is not None:
                 if before_search is None:
@@ -739,7 +776,20 @@ class Switcher:
     def restore(self,ident):
         with self.lock(allow_pending=True):
             original=self.store.verify(ident)
-            config=tomllib.loads(self.store.content(ident,'config.toml').decode())
+            backup_text=self.store.content(ident,'config.toml').decode()
+            config=tomllib.loads(backup_text)
+            if self.config.is_symlink():raise ValueError('配置文件不能是符号链接')
+            damaged=self.config.read_bytes() if self.config.exists() else None
+            rebuilt=False
+            try:
+                current_text=damaged.decode() if damaged is not None else ''
+                if damaged is None:raise ValueError('missing config')
+                tomllib.loads(current_text)
+            except (ValueError,UnicodeError):
+                rebuilt=True
+                # Snapshot secrets are placeholders, never usable credentials.
+                current_text=''.join(line for line in backup_text.splitlines(keepends=True)
+                                     if not (SECRET_LINE.match(line) and '<stored-in-keychain>' in line))
             values={k:config.get(k) for k in (*MANAGED,'web_search')}
             search_state=(validate_search_preferences(json.loads(self.store.content(ident,'provider-switcher/search-state.json')))
                           if 'provider-switcher/search-state.json' in original['files'] else None)
@@ -747,12 +797,12 @@ class Switcher:
             routes=[{**r,'model_provider':'ds_api' if r['model_provider'] in deepseek_ids else r['model_provider']} for r in original['routes']]
             if values.get('model_provider') in deepseek_ids:
                 values['model_provider']='ds_api'
-            text=rewrite_config(self.config.read_text(),values)
-            if any(r['model_provider']=='ds_api' for r in routes):
+            text=rewrite_config(current_text,values)
+            if rebuilt or any(r['model_provider']=='ds_api' for r in routes):
                 stored=self.keychain.get()
                 current=tomllib.loads(text).get('model_providers',{}).get('deepseek',{})
                 text=(set_deepseek_key(text,stored) if stored and not configured_key(current)
-                      else provider_auth_config(text))
+                      else provider_auth_config(text) if any(r['model_provider']=='ds_api' for r in routes) else text)
             updates=self.header_updates(routes)
             repair_manifest=original
             if not original.get('file_changes') and not original.get('compatibility') and self.pending.exists():
@@ -763,12 +813,23 @@ class Switcher:
             catalog=None
             if original.get('search_catalog_managed'):
                 _,catalog=self.search_catalog({},json.loads(self.store.content(ident,'models.json')))
+            saved_config=None
+            if rebuilt and damaged is not None:
+                recovery=self.data/'config-recovery'
+                if recovery.is_symlink():raise ValueError('损坏配置保留目录不能是符号链接')
+                recovery.mkdir(mode=0o700,exist_ok=True)
+                recovery.chmod(0o700)
+                saved_config=recovery/(str(uuid.uuid4())+'.toml')
+                atomic_write(saved_config,damaged)
             # New threads and all message history are deliberately left in place.
-            safety=self.snapshot(file_changes=compatibility,manage_search_catalog=catalog is not None)
+            safety=self.snapshot(file_changes=compatibility,manage_search_catalog=catalog is not None,skip_config=rebuilt)
             self._apply(text,routes,safety['id'],updates,recovery_id=ident,compatibility=compatibility,search_state=search_state,catalog=catalog)
             removed=self._cleanup() if self.settings()['auto_cleanup'] else []
             return {'restored':ident,'backup_id':safety['id'],'removed':len(removed),
-                    'message':'已恢复模型、服务商与联网设置；恢复点之后的新会话、新消息均保留。'}
+                    'config_rebuilt':rebuilt,'saved_config':str(saved_config) if saved_config else None,
+                    'message':('已从备份重建配置；损坏文件已单独保留，未备份的设置需手动合并；缺失密钥请重新填写。' if saved_config else
+                               '已从备份重建缺失配置；缺失密钥请重新填写。' if rebuilt else '')+
+                              '已恢复模型、服务商与联网设置；恢复点之后的新会话、新消息均保留。'}
 
     def repair_compatibility(self,ident=None):
         with self.lock():
@@ -894,7 +955,7 @@ class Switcher:
 
     def bridge(self,tid):
         """Resume an existing continuation before creating one; persist setup checkpoints."""
-        from .rpc import Rpc
+        from .rpc import Rpc, RpcTimeoutError
         from .diagnostics import ADVICE, classify_error, read_json
         with self.lock():
             with self.connect(True) as db:
@@ -982,10 +1043,14 @@ class Switcher:
                     save(status='in_progress',turn_id=turn['id'])
                     deadline=time.monotonic()+150
                     while turn['status']=='inProgress' and time.monotonic()<deadline:
-                        event=rpc.receive(min(45,max(1,deadline-time.monotonic())))
+                        try:event=rpc.receive(min(45,max(0,deadline-time.monotonic())))
+                        except RpcTimeoutError:continue
                         params=event.get('params',{})
                         if (event.get('method')=='turn/completed' and params.get('threadId')==new_id
                                 and params.get('turn',{}).get('id')==turn['id']):turn=params['turn']
+                    if turn['status']=='inProgress':
+                        save(status='unverified',category='network')
+                        return result(False,'等待接续回复超过 150 秒，尚不能确认运行结果。请打开已有接续查看；下次会先检查是否仍在运行，不重复创建或注入历史。','network')
                     if turn['status']!='completed':
                         category=classify_error(turn.get('error',{}))
                         save(status='failed',category=category)
@@ -1008,7 +1073,7 @@ class Switcher:
             order='recency_at_ms desc' if 'recency_at_ms' in columns else 'id'
             title="coalesce(nullif(name,''),title) as title" if 'name' in columns else 'title'
             threads=[dict(r) for r in con.execute('select id,'+title+',model_provider,model,archived from threads order by '+order)]
-        snapshots=self.store.list()
+        snapshots=configuration_backups(self.store)
         links_path=self.data/'links.json'
         from .diagnostics import read_json
         links=read_json(links_path,{})

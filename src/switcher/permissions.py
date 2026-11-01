@@ -83,7 +83,7 @@ def _check_path(path, directory=False, recursive=False, writable=True):
     return count
 
 
-def check_permissions(home=None):
+def check_permissions(home=None, allow_missing_config=False):
     home = Path(home or Path.home() / '.codex').expanduser().absolute()
     checks = []
 
@@ -113,7 +113,7 @@ def check_permissions(home=None):
         return row['status'] == 'ok'
 
     if check('Codex 数据目录', home, required=True, directory=True):
-        check('配置文件', home / 'config.toml', required=True)
+        check('配置文件', home / 'config.toml', required=not allow_missing_config)
         check('会话数据库', home / 'state_5.sqlite', required=True)
         for name, label in [('thread_history_1.sqlite', '分页历史数据库'), ('models.json', '模型目录')]:
             check(label, home / name)
@@ -131,8 +131,8 @@ def check_permissions(home=None):
             'summary': '文件读写检查通过' if ready else '文件访问检查未通过，写入已暂停'}
 
 
-def require_permissions(home=None):
-    report = check_permissions(home)
+def require_permissions(home=None, allow_missing_config=False):
+    report = check_permissions(home, allow_missing_config=allow_missing_config)
     if not report['ready']:
         raise PermissionCheckError(report)
     return report

@@ -34,7 +34,7 @@ def classify_error(error):
     if any(s in text for s in ('rate_limit', 'rate limit', 'too many requests', '429')):return 'rate_limit'
     if any(s in text for s in ('permission denied', 'operation not permitted', 'eacces', 'eperm')):return 'permission'
     if any(s in text for s in ('invalid_api_key', 'unauthorized', 'authentication', '401')):return 'authentication'
-    if any(s in text for s in ('timed out', 'timeout', 'connection reset', 'connection refused',
+    if any(s in text for s in ('timed out', 'timeout', '超时', 'connection reset', 'connection refused',
                                'network', 'dns', 'stream disconnected', 'connection closed')):return 'network'
     return 'unknown'
 
@@ -61,6 +61,7 @@ def _paths(home, tid, stored):
         payload = header.get('payload', {})
         return header.get('type') == 'session_meta' and payload.get('id', payload.get('session_id')) == tid
     paths = []
+    search_incomplete = False
     if stored:
         path = Path(stored)
         if not path.is_absolute():path = home/path
@@ -70,11 +71,16 @@ def _paths(home, tid, stored):
         base = home/name
         if base.is_symlink():raise ValueError('会话目录不能是符号链接')
         for path in base.rglob('*.jsonl'):
-            if path in paths or not candidate(path):continue
             try:
+                if path in paths or not candidate(path):continue
                 if matches(path):paths.append(path)
             except (ValueError, UnicodeError):continue
-    return paths
+            except OSError:
+                # We cannot attribute an unrelated unreadable file to this thread.
+                # Known target paths and conventional same-ID names still fail visibly.
+                if path.name == tid+'.jsonl' or path.name.endswith('-'+tid+'.jsonl'):raise
+                search_incomplete = True
+    return paths, search_incomplete
 
 
 def diagnose_thread(home, tid):
@@ -107,12 +113,13 @@ def diagnose_thread(home, tid):
             category = 'unknown'; evidence = '最近一轮未正常完成，但没有详细错误记录。'
     state = 'unchecked'; format_summary = '未找到本机会话文件，未检查历史格式。'; repair_records = 0
     try:
-        paths = _paths(home, tid, row['rollout_path'] if 'rollout_path' in row.keys() else None)
+        paths, search_incomplete = _paths(home, tid, row['rollout_path'] if 'rollout_path' in row.keys() else None)
         if paths:
             repair_records = sum(len(plan_repairs(path)) for path in paths)
             state = 'repairable' if repair_records else 'local_checked'
             format_summary = ('面向 GPT 的格式检查：发现 '+str(repair_records)+' 条可安全修复的推理记录。' if repair_records else
                               '面向 GPT 的本地格式检查通过：未发现已知推理格式冲突；尚未验证模型回复。')
+        if search_incomplete:format_summary += ' 部分其他文件无法读取，仅检查已找到的会话文件。'
     except ValueError:
         state = 'needs_continuation'; format_summary = '存在无法安全自动修复的历史格式，建议兼容接续。'
     except (OSError, sqlite3.Error):

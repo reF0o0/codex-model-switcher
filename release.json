@@ -1,7 +1,7 @@
 {
-  "version": "1.5.0",
+  "version": "1.5.1",
   "original_date": "2026-10-19",
-  "asset": "Codex-Model-Switcher-v1.5.0.zip",
-  "sha256": "6a5509bed0106a512a01a18599ace093e23ecd7a28bbf6b76a0875f5c40355d2",
+  "asset": "Codex-Model-Switcher-v1.5.1.zip",
+  "sha256": "a35ed917816ad29a5e47ce74950e75754bd14db09b4c04b475f350c0abad2d43",
   "source_status": "python-backend-only; Swift frontend source not preserved"
 }

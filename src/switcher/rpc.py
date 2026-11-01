@@ -8,6 +8,10 @@ import time
 from collections import deque
 
 
+class RpcTimeoutError(TimeoutError):
+    """No event arrived before this receive call's deadline."""
+
+
 class Rpc:
     def __init__(self, home):
         choices=[Path('/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex'),
@@ -47,7 +51,7 @@ class Rpc:
                 chunk=os.read(self.process.stdout.fileno(),65536)
                 if not chunk:raise ValueError('Codex 后端已退出')
                 self.buffer+=chunk
-        raise ValueError('等待 Codex 后端超时；原会话保留')
+        raise RpcTimeoutError('等待 Codex 后端超时；原会话保留')
 
     def call(self,method,params):
         self.ident+=1

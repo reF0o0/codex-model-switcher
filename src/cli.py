@@ -27,18 +27,21 @@ def require(data,name,what):
 def main():
     p=argparse.ArgumentParser()
     p.add_argument('--home')
-    p.add_argument('command',choices=['permissions','diagnose','status','startup','live-status','switch','backup','restore','cleanup','settings','save-key','bridge','repair','repair-formats','repair-deepseek','web-search'])
+    p.add_argument('command',choices=['permissions','recovery-status','diagnose','status','startup','live-status','switch','backup','restore','cleanup','settings','save-key','bridge','repair','repair-formats','repair-deepseek','web-search'])
     args=p.parse_args()
     data=payload() if args.command in PAYLOAD_COMMANDS else {}
     # Permission reporting must work even when Switcher cannot create its data directory.
     if args.command=='permissions':
         print(json.dumps({'ok':True,'result':check_permissions(args.home)},ensure_ascii=False))
         return
+    if args.command=='recovery-status':
+        print(json.dumps({'ok':True,'result':Switcher.recovery_status(args.home)},ensure_ascii=False))
+        return
     if args.command=='diagnose':
         from switcher.diagnostics import diagnose_thread
         print(json.dumps({'ok':True,'result':diagnose_thread(args.home,require(data,'id','会话 ID'))},ensure_ascii=False))
         return
-    if args.command!='live-status':require_permissions(args.home)
+    if args.command!='live-status':require_permissions(args.home, allow_missing_config=args.command=='restore')
     app=Switcher(args.home)
     if args.command in ['status','startup']:
         if args.command=='startup' and app.settings()['auto_cleanup']:app.cleanup()
