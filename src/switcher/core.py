@@ -631,7 +631,10 @@ class Switcher:
         protected+=self.repair_backups()
         # Recovery safety snapshots may have no usable config. They must not
         # displace the last three actual configuration recovery points.
-        protected += [entry['id'] for entry in configuration_backups(self.store)[:3]]
+        recovery_points=configuration_backups(self.store)
+        protected += [entry['id'] for entry in recovery_points[:3]]
+        # Configuration-only backups must not displace database recovery points.
+        protected += [entry['id'] for entry in recovery_points if 'state_5.sqlite' in entry['files']][:3]
         return self.store.prune(settings['keep'],settings['days'],protected=protected)
 
     def backup(self):
@@ -901,11 +904,11 @@ class Switcher:
         elif compatibility:journal['compatibility_backup_id']=backup_id
         plans={p:list(changes) for p,changes in (compatibility or {}).items()}
         for path,old,new in updates:plans.setdefault(path,[]).insert(0,Change(0,old,new))
-        con=self.connect()
+        con=self.connect() if routes or plans else None
         atomic_write(self.pending,json.dumps(journal).encode())
         changed=[]
         try:
-            con.execute('begin immediate')
+            if con is not None:con.execute('begin immediate')
             for path,changes in plans.items():
                 changed.append((path,changes))
                 replace_ranges(path,changes)
@@ -915,9 +918,9 @@ class Switcher:
             atomic_write(self.config,text.encode())
             if search_state is not None:atomic_write(self.search_file,json.dumps(search_state).encode())
             if catalog is not None:atomic_write(self.home/'models.json',catalog)
-            con.commit()
+            if con is not None:con.commit()
         except Exception:
-            con.rollback()
+            if con is not None:con.rollback()
             for path,changes in reversed(changed):
                 inverse=[]
                 with path.open('rb') as stream:
@@ -937,50 +940,86 @@ class Switcher:
                     self.search_file.unlink(missing_ok=True);sync_directory(self.data)
                 else:atomic_write(self.search_file,before_search)
             raise
-        finally:con.close()
+        finally:
+            if con is not None:con.close()
         self.pending.unlink(missing_ok=True)
         sync_directory(self.data)
 
-    def switch(self,provider,model,effort='high',days=30):
+    def _prepare_switch(self,provider,model,effort='high',days=30):
         option=next((m for m in self.model_options().get(provider,[]) if m['slug']==model),None)
         if option is None:raise ValueError('服务商与模型不匹配')
         if effort not in option['efforts']:raise ValueError('推理强度无效：当前模型不支持 '+str(effort))
         if type(days) is not int or not 1<=days<=365:raise ValueError('会话范围必须是 1–365 天')
+        text=self.config.read_text()
+        if provider=='deepseek':
+            current=tomllib.loads(text).get('model_providers',{}).get('deepseek',{})
+            stored=self.keychain.get()
+            if stored and not configured_key(current):
+                text=set_deepseek_key(text,stored)
+        cfg=tomllib.loads(text)
+        _,profile=profile_config(cfg)
+        if profile:raise ValueError('当前 profile 覆盖了设置，请先取消或修改该配置档')
+        search_state=self.search_preferences(strict=True)
+        current=logical_provider(cfg)
+        current_mode=cfg.get('web_search')
+        if current_mode is not None and current_mode not in SEARCH_MODES:
+            raise ValueError('当前联网配置无效，已停止切换')
+        if native_search_supported(current,cfg.get('model')) and current_mode is not None:
+            search_state[current]=current_mode
+        values={k:None for k in MANAGED}
+        values.update(model_provider=provider,model=model,model_reasoning_effort=effort)
+        values['web_search']=(search_state.get(provider) or 'live') if native_search_supported(provider,model) else 'disabled'
+        stored_provider='ds_api' if provider=='deepseek' else provider
+        values['model_provider']=stored_provider
+        if provider=='deepseek':
+            p=cfg.get('model_providers',{}).get('deepseek',{})
+            if not (configured_key(p) or (p.get('env_key') and os.environ.get(p['env_key']))):
+                raise ValueError('DeepSeek API key 未配置，请在密钥设置中保存')
+            catalog=self.home/'models.json'
+            if not catalog.is_file() or not set(MODELS['deepseek']) <= {m['slug'] for m in json.loads(catalog.read_text())['models']}:
+                raise ValueError('未找到可用的 DeepSeek 模型目录 models.json')
+            values.update(model_catalog_json=str(catalog),disable_response_storage=True)
+            text=provider_auth_config(text)
+        text=rewrite_config(text,values)
+        catalog=None
+        if provider=='deepseek' and values['web_search']=='live':
+            _,catalog=self.search_catalog(tomllib.loads(text))
+        return text,cfg,search_state,catalog,stored_provider
+
+    def preview_switch(self,provider,model,effort='high',days=30,migrate=True):
+        if type(migrate) is not bool:raise ValueError('迁移历史选项必须是 true 或 false')
+        text,cfg,_,_,_=self._prepare_switch(provider,model,effort,days)
+        target=tomllib.loads(text)
+        candidates=([r for r in self.switch_routes(days) if r['model_provider'] in migration_providers(cfg)]
+                    if migrate else [])
+        return {'current_provider':logical_provider(cfg),'current_model':cfg.get('model','默认'),
+                'current_effort':cfg.get('model_reasoning_effort','默认'),
+                'provider':provider,'model':model,'effort':effort,'migrate':migrate,
+                'scope_days':days,'candidate_threads':len(candidates),'web_search':target.get('web_search','default'),
+                'message':('候选会话将逐条检查，异常会话会跳过；先备份再写入。' if migrate else
+                           '只备份并修改默认模型及联网配置，历史会话文件和路由保持原状。')}
+
+    def snapshot_configuration(self,manage_search_catalog=False):
+        files={'config.toml':redact_config(self.config.read_text()).encode(),
+               'provider-switcher/search-state.json':json.dumps(self.search_preferences()).encode()}
+        if (self.home/'models.json').is_file():files['models.json']=self.home/'models.json'
+        manifest=self.store.create(files,[])
+        manifest['scope']='configuration'
+        if manage_search_catalog:
+            manifest['search_catalog_managed']=True
+            manifest['search_catalog_model']=manage_search_catalog
+        atomic_write(self.store.root/manifest['id']/'manifest.json',json.dumps(manifest,ensure_ascii=False).encode())
+        return manifest
+
+    def switch(self,provider,model,effort='high',days=30,migrate=True):
+        if type(migrate) is not bool:raise ValueError('迁移历史选项必须是 true 或 false')
         with self.lock():
-            text=self.config.read_text()
-            if provider=='deepseek':
-                current=tomllib.loads(text).get('model_providers',{}).get('deepseek',{})
-                stored=self.keychain.get()
-                if stored and not configured_key(current):
-                    text=set_deepseek_key(text,stored)
-            cfg=tomllib.loads(text)
-            _,profile=profile_config(cfg)
-            if profile:raise ValueError('当前 profile 覆盖了设置，请先取消或修改该配置档')
-            search_state=self.search_preferences(strict=True)
-            current=logical_provider(cfg)
-            current_mode=cfg.get('web_search')
-            if current_mode is not None and current_mode not in SEARCH_MODES:
-                raise ValueError('当前联网配置无效，已停止切换')
-            if native_search_supported(current,cfg.get('model')) and current_mode is not None:
-                search_state[current]=current_mode
-            values={k:None for k in MANAGED}
-            values.update(model_provider=provider,model=model,model_reasoning_effort=effort)
-            values['web_search']=(search_state.get(provider) or 'live') if native_search_supported(provider,model) else 'disabled'
-            stored_provider='ds_api' if provider=='deepseek' else provider
-            values['model_provider']=stored_provider
-            if provider=='deepseek':
-                p=cfg.get('model_providers',{}).get('deepseek',{})
-                if not (configured_key(p) or (p.get('env_key') and os.environ.get(p['env_key']))):
-                    raise ValueError('DeepSeek API key 未配置，请在密钥设置中保存')
-                catalog=self.home/'models.json'
-                if not catalog.is_file() or not set(MODELS['deepseek']) <= {m['slug'] for m in json.loads(catalog.read_text())['models']}:
-                    raise ValueError('未找到可用的 DeepSeek 模型目录 models.json')
-                values.update(model_catalog_json=str(catalog),disable_response_storage=True)
-                text=provider_auth_config(text)
-            text=rewrite_config(text,values)
-            catalog=None
-            if provider=='deepseek' and values['web_search']=='live':
-                _,catalog=self.search_catalog(tomllib.loads(text))
+            text,cfg,search_state,catalog,stored_provider=self._prepare_switch(provider,model,effort,days)
+            if not migrate:
+                snapshot=self.snapshot_configuration(model if catalog is not None else False)
+                self._apply(text,[],snapshot['id'],[],search_state=search_state,catalog=catalog)
+                return {'provider':provider,'model':model,'migrated':0,'backup_id':snapshot['id'],
+                        'message':'默认模型已修改；历史会话文件和路由未迁移。重新打开 ChatGPT/Codex 后使用。'}
             routes=self.switch_routes(days)
             # Other custom providers remain untouched; only the user's GPT/DeepSeek groups migrate.
             affected=[r for r in routes if r['model_provider'] in migration_providers(cfg)]
@@ -1060,11 +1099,11 @@ class Switcher:
             if values.get('model_provider') in deepseek_ids:
                 values['model_provider']='ds_api'
             text=rewrite_config(current_text,values)
-            if rebuilt or any(r['model_provider']=='ds_api' for r in routes):
+            if rebuilt or values.get('model_provider')=='ds_api' or any(r['model_provider']=='ds_api' for r in routes):
                 stored=self.keychain.get()
                 current=tomllib.loads(text).get('model_providers',{}).get('deepseek',{})
                 text=(set_deepseek_key(text,stored) if stored and not configured_key(current)
-                      else provider_auth_config(text) if any(r['model_provider']=='ds_api' for r in routes) else text)
+                      else provider_auth_config(text) if values.get('model_provider')=='ds_api' or any(r['model_provider']=='ds_api' for r in routes) else text)
             header_skipped=[]
             header_blocked=set()
             updates=self.header_updates(routes,skipped=header_skipped,blocked=header_blocked)
@@ -1397,7 +1436,7 @@ class Switcher:
                               '已有接续已保留，下次优先使用同一会话。',category)
             return result(True,'已'+('复用' if reused else '创建')+label+'兼容接续，并验证回复成功；原会话保留。')
 
-    def status(self):
+    def status(self,detailed=True):
         warnings=[]
         config=tomllib.loads(self.config.read_text())
         live=self.runtime_status(config)
@@ -1425,12 +1464,13 @@ class Switcher:
         deepseek_config=config.get('model_providers',{}).get('deepseek',{})
         config_key=bool(configured_key(deepseek_config) or
                         (deepseek_config.get('env_key') and os.environ.get(deepseek_config['env_key'])))
-        keychain_key=self.keychain.get()
+        keychain_key=self.keychain.get() if detailed else None
         key_configured=bool(keychain_key or config_key)
-        key_storage='keychain' if keychain_key else ('config' if config_key else 'none')
+        key_storage='keychain' if keychain_key else ('config' if config_key else 'none' if detailed else 'unchecked')
         try:
             eligible=migration_providers(config)
-            _,preview=self.compatibility_restore_all({t['id'] for t in threads if t['model_provider'] in eligible})
+            preview=(self.compatibility_restore_all({t['id'] for t in threads if t['model_provider'] in eligible})[1]
+                     if detailed else None)
         except (ValueError,OSError):
             preview={'threads':0,'records':0,'skipped':[],
                      'error':'无法读取还原计划，切换前将重新检查备份；不会自动覆盖会话。'}
@@ -1443,12 +1483,12 @@ class Switcher:
             except (ValueError,UnicodeError):
                 pending_error=True
                 warnings.append('pending.json 无法解析；已阻止新的写入，请先检查未完成的操作。')
-        return {**live,'threads':threads,'last_switch':last_switch,
+        return {**live,'history_checked':detailed,'threads':threads,'last_switch':last_switch,
                 'switch_days':30,
                 'recent_thread_count':sum(1 for t in threads
                                           if not t['activity_ms'] or t['activity_ms']>= (time.time()-30*86400)*1000),
                 'ignored_attention':self.attention_ignores(warnings),
-                'backups':[{'id':s['id'],'created_at':s['created_at'],'files':len(s['files'])} for s in snapshots],
+                'backups':[{'id':s['id'],'created_at':s['created_at'],'files':len(s['files']),'scope':s.get('scope','full')} for s in snapshots],
                 'settings':self.settings(warnings),
                 'pending':pending,'pending_error':pending_error,'warnings':warnings,
                 'backup_path':str(self.store.root),

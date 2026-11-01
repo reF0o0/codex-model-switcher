@@ -83,7 +83,7 @@ def _check_path(path, directory=False, recursive=False, writable=True):
     return count
 
 
-def check_permissions(home=None, allow_missing_config=False):
+def check_permissions(home=None, allow_missing_config=False, full=True):
     home = Path(home or Path.home() / '.codex').expanduser().absolute()
     checks = []
 
@@ -121,18 +121,19 @@ def check_permissions(home=None, allow_missing_config=False):
             for suffix in ('-wal', '-shm', '-journal'):
                 check('数据库辅助文件：' + database + suffix, home / (database + suffix))
         for name, label in [('sessions', '会话文件'), ('archived_sessions', '归档会话')]:
-            check(label, home / name, directory=True, recursive=True)
+            check(label, home / name, directory=True, recursive=full)
         # Backups are immutable; reading them and probing their directories is enough.
-        check('备份与工具数据', home / 'provider-switcher', directory=True, recursive=True, writable=False)
+        check('备份与工具数据', home / 'provider-switcher', directory=True, recursive=full, writable=False)
         for name in ('settings.json', 'search-state.json', 'links.json', 'bridge-state.json', 'last-switch.json', 'pending.json', 'operation.lock'):
             check('工具设置：' + name, home / 'provider-switcher' / name)
     ready = all(c['status'] in ('ok', 'optional') for c in checks)
     return {'ready': ready, 'checked_at': time.time(), 'checks': checks,
-            'summary': '文件读写检查通过' if ready else '文件访问检查未通过，写入已暂停'}
+            'scope': 'full' if full else 'basic',
+            'summary': ('文件读写检查通过' if full else '基础访问检查通过；写入前会完整检查') if ready else '文件访问检查未通过，写入已暂停'}
 
 
-def require_permissions(home=None, allow_missing_config=False):
-    report = check_permissions(home, allow_missing_config=allow_missing_config)
+def require_permissions(home=None, allow_missing_config=False, full=True):
+    report = check_permissions(home, allow_missing_config=allow_missing_config, full=full)
     if not report['ready']:
         raise PermissionCheckError(report)
     return report

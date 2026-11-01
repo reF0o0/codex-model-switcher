@@ -13,6 +13,7 @@ struct RecoveryModelChecks {
         while !predicate() && Date() < deadline {RunLoop.main.run(until:Date().addingTimeInterval(0.02))}
         try require(predicate(), "async update timed out")
     }
+    @MainActor
     static func main() throws {
         _ = NSApplication.shared
         let resources = Bundle.main.resourceURL!
@@ -103,6 +104,21 @@ struct RecoveryModelChecks {
         try require(app.effortChoices.contains("max") && app.effort == "max", "catalog reasoning levels missing")
         app.model = "gpt-6-luna"; app.normalizeTarget()
         try require(app.effort == "high", "unsupported target effort must reset")
+        try require(app.snapshot?.history_checked == false, "UI status must not scan history on refresh")
+        app.defaultOnly = true
+        app.provider = "openai"; app.model = "gpt-6.1-terra"; app.effort = "max"
+        let originalProviders = app.snapshot!.threads.map(\.model_provider)
+        app.prepareSwitch(); try wait {!app.preparingSwitch}
+        try require(app.switchPreview?.candidate_threads == 0 && app.switchPreview?.migrate == false,
+                    "default-only preview should not migrate any session")
+        try require(app.switchPreviewText.contains("gpt-6.1-terra") && app.confirmSwitch,
+                    "confirmation must show the actual prepared target")
+        app.performPreparedSwitch(); try wait {!app.busy}
+        try require(app.error == nil && app.live?.model == "gpt-6.1-terra",
+                    "default-only switch failed through UI and CLI")
+        try require(app.snapshot!.threads.map(\.model_provider) == originalProviders,
+                    "default-only operation changed historical providers")
+        print("Fast startup and default-only preview checks: PASS")
         print("Model catalog and lightweight refresh AppModel checks: PASS")
         print("Search AppModel checks: PASS (GPT/Pro defaults, toggles, CLI refresh, client guard, independent preferences, Flash limitation)")
         print("Recovery AppModel checks: PASS (missing/invalid config, backup selection, client guard, file permission gate, restoration, retained damage, database recovery, normal state)")

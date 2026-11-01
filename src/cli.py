@@ -5,7 +5,7 @@ sys.dont_write_bytecode = True
 from switcher.core import Switcher
 from switcher.permissions import check_permissions, require_permissions, PermissionCheckError
 
-PAYLOAD_COMMANDS=['switch','restore','recover-database','settings','save-key','bridge','diagnose','ignore-attention','repair-formats','repair-deepseek','web-search']
+PAYLOAD_COMMANDS=['preview-switch','switch','restore','recover-database','settings','save-key','bridge','diagnose','ignore-attention','repair-formats','repair-deepseek','web-search']
 
 
 def payload():
@@ -27,12 +27,12 @@ def require(data,name,what):
 def main():
     p=argparse.ArgumentParser()
     p.add_argument('--home')
-    p.add_argument('command',choices=['permissions','recovery-status','diagnose','status','startup','live-status','switch','backup','restore','recover-database','cleanup','settings','save-key','bridge','ignore-attention','clear-attention-ignores','repair','repair-formats','repair-deepseek','web-search'])
+    p.add_argument('command',choices=['quick-permissions','preview-switch','permissions','recovery-status','diagnose','status','startup','live-status','switch','backup','restore','recover-database','cleanup','settings','save-key','bridge','ignore-attention','clear-attention-ignores','repair','repair-formats','repair-deepseek','web-search'])
     args=p.parse_args()
     data=payload() if args.command in PAYLOAD_COMMANDS else {}
     # Permission reporting must work even when Switcher cannot create its data directory.
-    if args.command=='permissions':
-        print(json.dumps({'ok':True,'result':check_permissions(args.home)},ensure_ascii=False))
+    if args.command in ('permissions','quick-permissions'):
+        print(json.dumps({'ok':True,'result':check_permissions(args.home,full=args.command=='permissions')},ensure_ascii=False))
         return
     if args.command=='recovery-status':
         print(json.dumps({'ok':True,'result':Switcher.recovery_status(args.home)},ensure_ascii=False))
@@ -41,13 +41,16 @@ def main():
         from switcher.diagnostics import diagnose_thread
         print(json.dumps({'ok':True,'result':diagnose_thread(args.home,require(data,'id','会话 ID'))},ensure_ascii=False))
         return
-    if args.command!='live-status':require_permissions(args.home, allow_missing_config=args.command in ('restore','recover-database'))
+    if args.command!='live-status':require_permissions(args.home, allow_missing_config=args.command in ('restore','recover-database'),
+                                                             full=args.command not in ('startup','status','preview-switch'))
     app=Switcher(args.home)
     if args.command in ['status','startup']:
-        if args.command=='startup' and app.settings()['auto_cleanup']:app.cleanup()
-        result=app.status()
+        result=app.status(detailed=False)
     elif args.command=='live-status':result=app.runtime_status()
-    elif args.command=='switch':result=app.switch(require(data,'provider','服务商'),require(data,'model','模型'),data.get('effort','high'),days=int(data.get('days',30)))
+    elif args.command in ('switch','preview-switch'):
+        method=app.switch if args.command=='switch' else app.preview_switch
+        result=method(require(data,'provider','服务商'),require(data,'model','模型'),data.get('effort','high'),
+                      days=int(data.get('days',30)),migrate=data.get('migrate',True))
     elif args.command=='backup':result=app.backup()
     elif args.command=='restore':result=app.restore(require(data,'id','备份 ID'))
     elif args.command=='recover-database':result=app.recover_database(require(data,'id','备份 ID'))

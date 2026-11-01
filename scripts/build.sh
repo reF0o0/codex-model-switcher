@@ -25,10 +25,11 @@ fi
 task_staging="$(mktemp -d /private/tmp/codex-provider-switcher.XXXXXX)"
 task_build_app="$task_staging/Codex 模型切换器.app"
 mkdir -p "$task_build_app/Contents/MacOS" "$task_build_app/Contents/Resources/backend" "$task_root/dist" "$task_root/build"
-/usr/bin/swiftc -parse-as-library -O -target arm64-apple-macosx14.0 \
-  "$task_root/app/App.swift" -o "$task_build_app/Contents/MacOS/ProviderSwitcher"
+/usr/bin/swiftc -parse-as-library -swift-version 6 -warnings-as-errors -O -target arm64-apple-macosx14.0 \
+  "$task_root"/app/*.swift -o "$task_build_app/Contents/MacOS/ProviderSwitcher"
 /usr/bin/rsync -a --exclude __pycache__ --exclude '*.pyc' "$task_root/src/" "$task_build_app/Contents/Resources/backend/"
 /bin/cp "$task_root/assets/ProviderGPT.png" "$task_root/assets/ProviderDeepSeek.png" "$task_build_app/Contents/Resources/"
+/bin/cp "$task_root"/assets/Preview*.json "$task_build_app/Contents/Resources/"
 /bin/cp "$task_root/TERMS.md" "$task_build_app/Contents/Resources/TERMS.md"
 task_iconset="$task_staging/AppIcon.iconset"
 mkdir -p "$task_iconset"

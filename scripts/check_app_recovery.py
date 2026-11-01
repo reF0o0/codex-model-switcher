@@ -45,8 +45,8 @@ runpy.run_path(str(backend/'_production_cli.py'), run_name='__main__')
             'CFBundleExecutable':'ProviderSwitcher', 'CFBundlePackageType':'APPL'}))
         executable = bundle/'Contents/MacOS/ProviderSwitcher'
         executable.parent.mkdir()
-        subprocess.run(['swiftc','-parse-as-library','-D','SWITCHER_MODEL_CHECKS',
-                        str(repo/'app/App.swift'),str(repo/'tests/RecoveryModelChecks.swift'),
+        subprocess.run(['swiftc','-parse-as-library','-D','SWITCHER_MODEL_CHECKS','-swift-version','6','-warnings-as-errors',
+                        *[str(p) for p in sorted((repo/'app').glob('*.swift'))],str(repo/'tests/RecoveryModelChecks.swift'),
                         '-o',str(executable)],check=True)
         subprocess.run([str(executable)],check=True)
     finally:fixture.tearDown()
