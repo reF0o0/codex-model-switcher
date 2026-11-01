@@ -68,6 +68,43 @@ struct RecoveryModelChecks {
         try require(app.error == nil && app.recovery == nil && app.canWrite,
                     "database recovery did not restore normal state")
         try require(app.snapshot?.threads.count == 2, "database recovery lost thread rows")
+        app.run("switch",["provider":"openai","model":"gpt-6.1-sol","effort":"high","days":30]); try wait {!app.busy}
+        try require(app.error == nil && app.live?.web_search.state == "on" && !app.enableSearch,
+                    "GPT must default to live search and offer disabling")
+        app.run("web-search",["enabled":false]); try wait {!app.busy}
+        try require(app.error == nil && app.live?.web_search.state == "off" && app.enableSearch,
+                    "GPT search toggle did not persist through CLI and refresh")
+        app.run("web-search",["enabled":true]); try wait {!app.busy}
+        try require(app.error == nil && app.live?.web_search.state == "on", "GPT search could not be reenabled")
+        try "running".write(to:desktop,atomically:true,encoding:.utf8)
+        app.run("status"); try wait {!app.busy}
+        app.run("web-search",["enabled":false]); try wait {!app.busy}
+        try require(app.error == nil && app.live?.web_search.state == "on" && !app.canWrite,
+                    "running-client guard must preserve GPT search configuration")
+        try "stopped".write(to:desktop,atomically:true,encoding:.utf8)
+        app.run("switch",["provider":"deepseek","model":"deepseek-v4-pro","effort":"high","days":30]); try wait {!app.busy}
+        try require(app.error == nil && app.live?.web_search.state == "on", "DeepSeek Pro must default to live search")
+        app.run("web-search",["enabled":false]); try wait {!app.busy}
+        app.run("switch",["provider":"openai","model":"gpt-6.1-sol","effort":"high","days":30]); try wait {!app.busy}
+        try require(app.live?.web_search.state == "on", "DeepSeek off must not disable GPT search")
+        app.run("switch",["provider":"deepseek","model":"deepseek-flash","effort":"high","days":30]); try wait {!app.busy}
+        try require(app.error == nil && app.live?.web_search.state == "unsupported" && app.live?.web_search.can_enable == false,
+                    "Flash must report the server-side native-search limitation")
+        app.run("switch",["provider":"deepseek","model":"deepseek-v4-pro","effort":"high","days":30]); try wait {!app.busy}
+        try require(app.error == nil && app.live?.web_search.state == "off", "Flash visit must preserve DeepSeek's explicit off preference")
+        try Data("{\"models\":[{\"slug\":\"gpt-6.1-terra\",\"supported_reasoning_levels\":[{\"effort\":\"high\"},{\"effort\":\"max\"}]}]}".utf8)
+            .write(to:home.appendingPathComponent("models_cache.json"))
+        let snapshotDate = app.snapshot!.checked_at
+        app.refreshLiveStatus(); try wait {!app.refreshInFlight}
+        try require(app.snapshot!.checked_at == snapshotDate && app.live!.checked_at > snapshotDate,
+                    "light refresh must update live state without replacing history snapshot")
+        try require(app.choices["openai"]!.contains("gpt-6.1-terra"), "catalog model missing")
+        app.provider = "openai"; app.model = "gpt-6.1-terra"; app.effort = "max"; app.normalizeTarget()
+        try require(app.effortChoices.contains("max") && app.effort == "max", "catalog reasoning levels missing")
+        app.model = "gpt-6-luna"; app.normalizeTarget()
+        try require(app.effort == "high", "unsupported target effort must reset")
+        print("Model catalog and lightweight refresh AppModel checks: PASS")
+        print("Search AppModel checks: PASS (GPT/Pro defaults, toggles, CLI refresh, client guard, independent preferences, Flash limitation)")
         print("Recovery AppModel checks: PASS (missing/invalid config, backup selection, client guard, file permission gate, restoration, retained damage, database recovery, normal state)")
     }
 }

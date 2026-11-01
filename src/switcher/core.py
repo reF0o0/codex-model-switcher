@@ -26,7 +26,7 @@ class ManagedConnection(sqlite3.Connection):
 
 MANAGED = ('model_provider', 'model', 'model_reasoning_effort', 'model_catalog_json',
            'preferred_auth_method', 'forced_login_method', 'disable_response_storage')
-MODELS = {'openai': ['gpt-6.1-sol','gpt-6-sol','gpt-6-luna','gpt-6-astra'],
+MODELS = {'openai': ['gpt-6.1-sol','gpt-6.1-terra','gpt-6-sol','gpt-6-luna','gpt-6-astra'],
           'deepseek': ['deepseek-flash','deepseek-v4-pro']}
 SECRET_LINE = re.compile(r'^\s*(experimental_bearer_token|api_key)\s*=')
 SEARCH_MODES = ('live','cached','indexed','disabled')
@@ -405,6 +405,44 @@ class Switcher:
                 else:current.pop(key,None)
         return ready,(json.dumps(catalog,ensure_ascii=False,indent=2)+'\n').encode() if current!=before else None
 
+    def model_options(self):
+        result={provider:[{'slug':slug,'efforts':['low','medium','high'] if provider=='openai' else ['low','high']}
+                          for slug in slugs] for provider,slugs in MODELS.items()}
+        allowed={'low','medium','high','xhigh','max','ultra'}
+        for provider,name,prefix in [('openai','models_cache.json','gpt-'),('deepseek','models.json','deepseek-')]:
+            try:
+                path=self.home/name
+                if path.is_symlink():continue
+                models=json.loads(path.read_text())['models']
+                if not isinstance(models,list):continue
+                for row in models:
+                    if not isinstance(row,dict):continue
+                    slug=row.get('slug')
+                    if not isinstance(slug,str) or not slug.startswith(prefix) or not re.fullmatch(r'[A-Za-z0-9._-]+',slug):continue
+                    levels=row.get('supported_reasoning_levels',[])
+                    efforts=[v.get('effort') for v in levels if isinstance(v,dict) and v.get('effort') in allowed] if isinstance(levels,list) else []
+                    previous=next((m for m in result[provider] if m['slug']==slug),None)
+                    entry={'slug':slug,'efforts':list(dict.fromkeys(efforts)) or (previous['efforts'] if previous else ['high'])}
+                    result[provider]=[entry if m['slug']==slug else m for m in result[provider]] if previous else result[provider]+[entry]
+            except (OSError,ValueError,KeyError,TypeError):continue
+        return result
+
+    def pending_journal(self, recovery=False):
+        if not self.pending.exists():return {}
+        try:
+            value=json.loads(self.pending.read_bytes())
+            if not isinstance(value,dict) or not isinstance(value.get('backup_id'),str):raise ValueError()
+            if any(not isinstance(v,str) for v in value.values()):raise ValueError()
+            return value
+        except (ValueError,UnicodeError):
+            if recovery:return {}
+            raise ValueError('未完成操作标记损坏，请选择备份执行应急恢复') from None
+
+    def exclude_blocked_plans(self, plans, blocked):
+        if not blocked:return plans
+        paths={p for ident,files in self.session_index().items() if ident in blocked for p in files}
+        return {p:changes for p,changes in plans.items() if p not in paths}
+
     def runtime_status(self,config=None):
         config=tomllib.loads(self.config.read_text()) if config is None else config
         config,profile=profile_config(config)
@@ -435,7 +473,7 @@ class Switcher:
                       'invalid':'联网配置无效，未修改任何设置'}
         return {'provider':provider,'model':model,'effort':config.get('model_reasoning_effort','默认'),
                 'desktop_running':desktop=='running','desktop_check':desktop,
-                'pending_operation':self.pending.exists(),'checked_at':time.time(),
+                'pending_operation':self.pending.exists(),'checked_at':time.time(),'model_options':self.model_options(),
                 'web_search':{'state':state,'mode':mode,'supported':supported,
                               'can_enable':supported and not profile and not catalog_error,
                               'can_disable':provider in MODELS and mode in ('live','cached','indexed') and not profile,
@@ -626,7 +664,9 @@ class Switcher:
             for path in base.rglob('*.jsonl'):
                 if path.is_symlink() or not path.resolve().is_relative_to(base.resolve()):raise ValueError('会话路径越界')
                 with path.open('rb') as f:line=f.readline()
-                try:record=json.loads(line)
+                try:
+                    record=json.loads(line)
+                    if not isinstance(record,dict) or not isinstance(record.get('payload'),dict):raise ValueError()
                 except (ValueError,UnicodeError):
                     target=self._route_for_path(path,routes)
                     detail='会话文件头无法解析：'+path.name+'；原文件未改动'
@@ -641,8 +681,8 @@ class Switcher:
                 payload=record['payload']
                 ident=payload.get('id',payload.get('session_id'))
                 if ident in by_id and payload.get('model_provider')!=by_id[ident]:
-                    updates.append((path,line,header_for_provider(line,by_id[ident])))
-        return updates
+                    updates.append((path,line,header_for_provider(line,by_id[ident]),ident))
+        return [(p,old,new) for p,old,new,ident in updates if ident not in (blocked or set())]
 
     def compatibility_updates(self,routes,strict=True):
         selected={r['id'] for r in routes}
@@ -848,7 +888,12 @@ class Switcher:
         before=self.config.read_bytes() if self.config.exists() else None
         before_search=self.search_file.read_bytes() if self.search_file.exists() else None
         before_catalog=(self.home/'models.json').read_bytes() if catalog is not None else None
-        previous=json.loads(self.pending.read_text()) if self.pending.exists() else {}
+        previous=self.pending_journal(recovery=recovery_id is not None)
+        if self.pending.exists() and not previous and recovery_id is not None:
+            folder=self.data/'journal-recovery'
+            if folder.is_symlink():raise ValueError('日志保留目录不能是符号链接')
+            folder.mkdir(mode=0o700,exist_ok=True)
+            atomic_write(folder/(str(uuid.uuid4())+'.json'),self.pending.read_bytes())
         if recovery_id is None and previous:recovery_id=previous['backup_id']
         journal={'backup_id':recovery_id or backup_id,'safety_backup_id':backup_id}
         if previous.get('compatibility_backup_id'):
@@ -897,9 +942,9 @@ class Switcher:
         sync_directory(self.data)
 
     def switch(self,provider,model,effort='high',days=30):
-        if provider not in MODELS or model not in MODELS[provider]:raise ValueError('服务商与模型不匹配')
-        if effort not in ['low','medium','high']:raise ValueError('推理强度无效')
-        if provider=='deepseek' and effort=='medium':raise ValueError('DeepSeek 请选择 low 或 high')
+        option=next((m for m in self.model_options().get(provider,[]) if m['slug']==model),None)
+        if option is None:raise ValueError('服务商与模型不匹配')
+        if effort not in option['efforts']:raise ValueError('推理强度无效：当前模型不支持 '+str(effort))
         if type(days) is not int or not 1<=days<=365:raise ValueError('会话范围必须是 1–365 天')
         with self.lock():
             text=self.config.read_text()
@@ -959,6 +1004,10 @@ class Switcher:
                 stats['skipped'].extend(header_skipped)
                 blocked |= header_blocked
                 updated=[r for r in updated if r['id'] not in header_blocked]
+                compatibility=self.exclude_blocked_plans(compatibility,header_blocked)
+                index=self.session_index()
+                stats['threads']=sum(any(p in compatibility for p in paths) for paths in index.values())
+                stats['records']=sum(len(changes) for changes in compatibility.values())
             # Both directions need an operation journal; only GPT repairs need
             # long-term protection of original DeepSeek reasoning.
             snapshot=self.snapshot(compatibility if provider=='openai' else None,
@@ -1023,10 +1072,10 @@ class Switcher:
                 routes=[r for r in routes if r['id'] not in header_blocked]
             repair_manifest=original
             if not original.get('file_changes') and not original.get('compatibility') and self.pending.exists():
-                pending=json.loads(self.pending.read_text())
+                pending=self.pending_journal(recovery=True)
                 if pending.get('compatibility_backup_id'):
                     repair_manifest=self.store.verify(pending['compatibility_backup_id'])
-            compatibility=self.compatibility_restore(repair_manifest)
+            compatibility=self.exclude_blocked_plans(self.compatibility_restore(repair_manifest),header_blocked)
             catalog=None
             catalog_model=original.get('search_catalog_model') or 'deepseek-v4-pro'
             if original.get('search_catalog_managed'):
@@ -1148,6 +1197,9 @@ class Switcher:
                 stats['skipped'].extend(header_skipped)
                 blocked |= header_blocked
                 updated=[r for r in updated if r['id'] not in header_blocked]
+                plans=self.exclude_blocked_plans(plans,header_blocked)
+                stats['threads']=sum(any(p in plans for p in paths) for paths in index.values())
+                stats['records']=sum(len(changes) for changes in plans.values())
             previous={r['id']:r for r in selected}
             changed=[r for r in updated if r!=previous[r['id']]]
             result={'provider':'deepseek','model':model,'compatibility':stats,
@@ -1167,6 +1219,8 @@ class Switcher:
         with self.lock():
             text=self.config.read_text()
             cfg=tomllib.loads(text)
+            _,profile=profile_config(cfg)
+            if profile:raise ValueError('当前 profile 覆盖了设置，请先取消或修改该配置档')
             provider=cfg.get('model_provider','openai')
             if provider not in ('openai','deepseek','ds_api'):
                 raise ValueError('当前配置不是 GPT 或 DeepSeek 服务商，无法修复')
@@ -1196,16 +1250,17 @@ class Switcher:
     def save_key(self,raw):
         key,note=normalize_key(raw)
         with self.lock():
+            text=set_deepseek_key(self.config.read_text(),key)
+            tomllib.loads(text)
+            snapshot=self.snapshot()
+            if self.require_closed and desktop_state()!='stopped':
+                raise ValueError('备份后无法确认 Codex 已退出，已停止写入。请退出并重试。')
             storage='config'
             try:
                 self.keychain.set(key)
                 storage='keychain'
             except KeychainError as exc:
                 note=(note+'；' if note else '')+str(exc)
-            text=self.config.read_text()
-            text=set_deepseek_key(text,key)
-            tomllib.loads(text)
-            snapshot=self.snapshot()
             atomic_write(self.config,text.encode())
             if self.settings()['auto_cleanup']:self._cleanup()
             message=('DeepSeek 密钥已保存到 macOS 钥匙串，并写入配置供 Codex 读取；ChatGPT 登录未更改。'
@@ -1242,7 +1297,7 @@ class Switcher:
             provider=cfg.get('model_provider','openai')
             model=cfg.get('model','gpt-6.1-sol')
             logical='deepseek' if provider in ['deepseek','ds_api'] else 'openai'
-            if model not in MODELS[logical]:raise ValueError('请先在切换页选择可用模型')
+            if model not in [m['slug'] for m in self.model_options()[logical]]:raise ValueError('请先在切换页选择可用模型')
             links_path=self.data/'links.json'
             state_path=self.data/'bridge-state.json'
             links=read_json(links_path,{})
@@ -1384,7 +1439,7 @@ class Switcher:
         pending=None
         pending_error=False
         if self.pending.exists():
-            try:pending=json.loads(self.pending.read_text())
+            try:pending=self.pending_journal()
             except (ValueError,UnicodeError):
                 pending_error=True
                 warnings.append('pending.json 无法解析；已阻止新的写入，请先检查未完成的操作。')

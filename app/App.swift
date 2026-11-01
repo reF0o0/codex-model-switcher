@@ -221,6 +221,10 @@ struct SearchState: Decodable {
     let requires_restart: Bool
     let description: String
 }
+struct ModelOption: Decodable {
+    let slug: String
+    let efforts: [String]
+}
 struct LiveStatus: Decodable {
     let provider: String
     let model: String
@@ -229,6 +233,7 @@ struct LiveStatus: Decodable {
     let pending_operation: Bool
     let checked_at: Double
     let web_search: SearchState
+    let model_options: [String:[ModelOption]]?
 }
 struct Snapshot: Decodable {
     let provider: String
@@ -249,6 +254,7 @@ struct Snapshot: Decodable {
     let warnings: [String]?
     let pending_error: Bool?
 
+    let model_options: [String:[ModelOption]]?
     let last_switch: SwitchSummary?
     let ignored_attention: [String]
     let switch_days: Int
@@ -256,7 +262,7 @@ struct Snapshot: Decodable {
     var liveStatus: LiveStatus {
         LiveStatus(provider:provider,model:model,effort:effort,desktop_check:desktop_check,
                    pending_operation:pending != nil || pending_error == true,
-                   checked_at:checked_at,web_search:web_search)
+                   checked_at:checked_at,web_search:web_search,model_options:model_options)
     }
 }
 
@@ -312,8 +318,21 @@ final class AppModel: ObservableObject {
     var liveGeneration = 0
     private var accessURLs: [URL] = []
     private let grants = DirectoryGrantStore(defaults:.standard)
-    let choices = ["openai":["gpt-6.1-sol","gpt-6-sol","gpt-6-luna","gpt-6-astra"],
-                   "deepseek":["deepseek-flash","deepseek-v4-pro"]]
+    var choices: [String:[String]] {
+        guard let options = live?.model_options else {
+            return ["openai":["gpt-6.1-sol","gpt-6.1-terra","gpt-6-sol","gpt-6-luna","gpt-6-astra"],
+                    "deepseek":["deepseek-flash","deepseek-v4-pro"]]
+        }
+        return options.mapValues {$0.map(\.slug)}
+    }
+    var effortChoices: [String] {
+        live?.model_options?[provider]?.first {$0.slug == model}?.efforts ??
+            (provider == "openai" ? ["low","medium","high"] : ["low","high"])
+    }
+    func normalizeTarget() {
+        if !(choices[provider] ?? []).contains(model) {model = choices[provider]?.first ?? "gpt-6.1-sol"}
+        if !effortChoices.contains(effort) {effort = effortChoices.contains("high") ? "high" : effortChoices.first ?? "high"}
+    }
     var attention: [AttentionRow] {
         var rows = snapshot?.last_switch?.attention ?? []
         for row in operationAttention {
@@ -456,7 +475,7 @@ final class AppModel: ObservableObject {
                 DispatchQueue.main.async {
                     self.refreshInFlight = false
                     guard generation == self.liveGeneration else {return}
-                    self.live = status; self.liveError = nil
+                    self.live = status; self.liveError = nil; self.normalizeTarget()
                 }
             } catch {
                 DispatchQueue.main.async {
@@ -639,6 +658,8 @@ final class AppModel: ObservableObject {
                     if !self.loaded {
                         self.provider = status.provider == "deepseek" ? "deepseek" : "openai"
                         self.model = self.choices[self.provider]!.contains(status.model) ? status.model : self.choices[self.provider]![0]
+                        self.effort = status.effort
+                        self.normalizeTarget()
                         self.loaded = true
                     }
                     if let message = message {self.notice = message}
@@ -748,7 +769,7 @@ struct ContentView: View {
                     Label("\(status.backups.count) 份备份",systemImage:"externaldrive")
                 }.font(.callout)
                 if app.live?.pending_operation == true {
-                    Label("检测到未完成的切换，请到备份页恢复。",systemImage:"exclamationmark.triangle.fill").foregroundStyle(.orange)
+                    Label("检测到未完成或损坏的操作标记，请到备份页选择备份恢复；损坏标记会单独保留。",systemImage:"exclamationmark.triangle.fill").foregroundStyle(.orange)
                 }
                 if app.desktopCheck == "running" {
                     Label("ChatGPT/Codex 正在运行。写入前请按 ⌘Q 退出并关闭 Codex 后台任务，再点刷新状态。",systemImage:"info.circle")
@@ -985,25 +1006,28 @@ struct ContentView: View {
                         Divider().frame(height:30)
                         Label(statusCount, systemImage:"bubble.left.and.bubble.right")
                         Spacer()
-                        Button("刷新状态",systemImage:"arrow.clockwise") {app.run("status")}
-                            .disabled(app.busy)
+                        Button("刷新状态",systemImage:"arrow.clockwise") {app.refreshLiveStatus()}
+                            .disabled(app.busy || app.refreshInFlight || !app.loaded)
                     }.padding(4)
                 }
 
+                if let checked = app.live?.checked_at {
+                    Text("配置读取于 \(Date(timeIntervalSince1970:checked).formatted(date:.abbreviated,time:.standard))；外部更改后请刷新状态。")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 Text("切换目标").font(.headline)
                 Picker("服务商",selection:$app.provider) {
                     Text("GPT · ChatGPT 额度").tag("openai")
                     Text("DeepSeek · API 额度").tag("deepseek")
                 }.pickerStyle(.segmented)
-                .onChange(of:app.provider) {_,new in app.model=app.choices[new]![0];app.effort="high"}
+                .onChange(of:app.provider) {_,new in app.model=app.choices[new]![0];app.effort="high";app.normalizeTarget()}
                 HStack(spacing:20) {
                     Picker("模型",selection:$app.model) {
                         ForEach(app.choices[app.provider] ?? [],id:\.self) {Text($0).tag($0)}
                     }
+                    .onChange(of:app.model) {_,_ in app.normalizeTarget()}
                     Picker("推理",selection:$app.effort) {
-                        Text("Low").tag("low")
-                        if app.provider == "openai" {Text("Medium").tag("medium")}
-                        Text("High").tag("high")
+                        ForEach(app.effortChoices,id:\.self) {Text($0.capitalized).tag($0)}
                     }.frame(width:160)
                 }
                 HStack(spacing:12) {
