@@ -329,7 +329,7 @@ struct ContentView: View {
                     Text("GPT · ChatGPT 额度").tag("openai")
                     Text("DeepSeek · API 额度").tag("deepseek")
                 }.pickerStyle(.segmented)
-                .onChange(of:app.provider) {_,new in app.model=app.choices[new]![0];app.effort="high";app.normalizeTarget()}
+                .onChange(of:app.provider) {_,new in app.model=app.choices[new]?.first ?? "";app.effort="high";app.normalizeTarget()}
                 HStack(spacing:20) {
                     Picker("模型",selection:$app.model) {
                         ForEach(app.choices[app.provider] ?? [],id:\.self) {Text($0).tag($0)}

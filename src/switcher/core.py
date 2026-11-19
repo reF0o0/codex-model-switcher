@@ -26,7 +26,8 @@ class ManagedConnection(sqlite3.Connection):
 
 MANAGED = ('model_provider', 'model', 'model_reasoning_effort', 'model_catalog_json',
            'preferred_auth_method', 'forced_login_method', 'disable_response_storage')
-MODELS = {'openai': ['gpt-6.1-sol','gpt-6.1-terra','gpt-6-sol','gpt-6-luna','gpt-6-astra'],
+MODELS = {'openai': ['gpt-6.2-sol','gpt-6.2-astra','gpt-6.1-terra','gpt-6.1-sol',
+                     'gpt-6-astra','gpt-6-sol','gpt-6-luna','gpt-5.6-sol','gpt-5.6-terra','gpt-5.6-luna'],
           'deepseek': ['deepseek-flash','deepseek-v4-pro']}
 SECRET_LINE = re.compile(r'^\s*(experimental_bearer_token|api_key)\s*=')
 SEARCH_MODES = ('live','cached','indexed','disabled')
@@ -415,15 +416,25 @@ class Switcher:
                 if path.is_symlink():continue
                 models=json.loads(path.read_text())['models']
                 if not isinstance(models,list):continue
+                cached=[]
+                catalog_valid=False
                 for row in models:
                     if not isinstance(row,dict):continue
                     slug=row.get('slug')
                     if not isinstance(slug,str) or not slug.startswith(prefix) or not re.fullmatch(r'[A-Za-z0-9._-]+',slug):continue
+                    catalog_valid=True
+                    if row.get('visibility','list')!='list':continue
+                    if any(m['slug']==slug for m in cached):continue
                     levels=row.get('supported_reasoning_levels',[])
                     efforts=[v.get('effort') for v in levels if isinstance(v,dict) and v.get('effort') in allowed] if isinstance(levels,list) else []
                     previous=next((m for m in result[provider] if m['slug']==slug),None)
                     entry={'slug':slug,'efforts':list(dict.fromkeys(efforts)) or (previous['efforts'] if previous else ['high'])}
-                    result[provider]=[entry if m['slug']==slug else m for m in result[provider]] if previous else result[provider]+[entry]
+                    cached.append(entry)
+                    if provider!='openai':
+                        result[provider]=[entry if m['slug']==slug else m for m in result[provider]] if previous else result[provider]+[entry]
+                # The account cache owns GPT availability and order. Fallbacks
+                # apply only when it is unavailable, not alongside live entries.
+                if provider=='openai' and catalog_valid:result[provider]=cached
             except (OSError,ValueError,KeyError,TypeError):continue
         return result
 

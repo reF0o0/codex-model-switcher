@@ -93,13 +93,13 @@ struct RecoveryModelChecks {
                     "Flash must report the server-side native-search limitation")
         app.run("switch",["provider":"deepseek","model":"deepseek-v4-pro","effort":"high","days":30]); try wait {!app.busy}
         try require(app.error == nil && app.live?.web_search.state == "off", "Flash visit must preserve DeepSeek's explicit off preference")
-        try Data("{\"models\":[{\"slug\":\"gpt-6.1-terra\",\"supported_reasoning_levels\":[{\"effort\":\"high\"},{\"effort\":\"max\"}]}]}".utf8)
+        try Data("{\"models\":[{\"slug\":\"gpt-6.2-sol\",\"visibility\":\"list\",\"supported_reasoning_levels\":[{\"effort\":\"high\"}]},{\"slug\":\"gpt-6.1-terra\",\"visibility\":\"list\",\"supported_reasoning_levels\":[{\"effort\":\"high\"},{\"effort\":\"max\"}]},{\"slug\":\"gpt-reserve\",\"visibility\":\"hide\"},{\"slug\":\"gpt-6-luna\",\"visibility\":\"list\",\"supported_reasoning_levels\":[{\"effort\":\"high\"}]}]}".utf8)
             .write(to:home.appendingPathComponent("models_cache.json"))
         let snapshotDate = app.snapshot!.checked_at
         app.refreshLiveStatus(); try wait {!app.refreshInFlight}
         try require(app.snapshot!.checked_at == snapshotDate && app.live!.checked_at > snapshotDate,
                     "light refresh must update live state without replacing history snapshot")
-        try require(app.choices["openai"]!.contains("gpt-6.1-terra"), "catalog model missing")
+        try require(app.choices["openai"] == ["gpt-6.2-sol", "gpt-6.1-terra", "gpt-6-luna"], "visible catalog choices and order must match")
         app.provider = "openai"; app.model = "gpt-6.1-terra"; app.effort = "max"; app.normalizeTarget()
         try require(app.effortChoices.contains("max") && app.effort == "max", "catalog reasoning levels missing")
         app.model = "gpt-6-luna"; app.normalizeTarget()

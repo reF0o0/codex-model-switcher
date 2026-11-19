@@ -20,7 +20,7 @@ final class AppModel: ObservableObject {
     @Published var accessError: String?
     @Published var recovery: RecoveryStatus?
     @Published var provider = "openai"
-    @Published var model = "gpt-6.1-sol"
+    @Published var model = "gpt-6.2-sol"
     @Published var effort = "high"
     @Published var keep = 10
     @Published var days = 30
@@ -60,7 +60,8 @@ final class AppModel: ObservableObject {
     private let grants = DirectoryGrantStore(defaults:.standard)
     var choices: [String:[String]] {
         guard let options = live?.model_options else {
-            return ["openai":["gpt-6.1-sol","gpt-6.1-terra","gpt-6-sol","gpt-6-luna","gpt-6-astra"],
+            return ["openai":["gpt-6.2-sol","gpt-6.2-astra","gpt-6.1-terra","gpt-6.1-sol",
+                              "gpt-6-astra","gpt-6-sol","gpt-6-luna","gpt-5.6-sol","gpt-5.6-terra","gpt-5.6-luna"],
                     "deepseek":["deepseek-flash","deepseek-v4-pro"]]
         }
         return options.mapValues {$0.map(\.slug)}
@@ -70,7 +71,7 @@ final class AppModel: ObservableObject {
             (provider == "openai" ? ["low","medium","high"] : ["low","high"])
     }
     func normalizeTarget() {
-        if !(choices[provider] ?? []).contains(model) {model = choices[provider]?.first ?? "gpt-6.1-sol"}
+        if !(choices[provider] ?? []).contains(model) {model = choices[provider]?.first ?? ""}
         if !effortChoices.contains(effort) {effort = effortChoices.contains("high") ? "high" : effortChoices.first ?? "high"}
     }
     var attention: [AttentionRow] {
@@ -337,7 +338,7 @@ final class AppModel: ObservableObject {
                     self.autoCleanup = status.settings.auto_cleanup
                     if !self.loaded {
                         self.provider = status.provider == "deepseek" ? "deepseek" : "openai"
-                        self.model = self.choices[self.provider]!.contains(status.model) ? status.model : self.choices[self.provider]![0]
+                        self.model = (self.choices[self.provider] ?? []).contains(status.model) ? status.model : self.choices[self.provider]?.first ?? ""
                         self.effort = status.effort
                         self.normalizeTarget()
                         self.loaded = true
