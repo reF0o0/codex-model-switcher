@@ -1,7 +1,8 @@
 # 版本下载
 
-最新版本：[1.8.0](https://github.com/reF0o0/codex-model-switcher/releases/tag/v1.8.0)。各版本均提供原始安装包与 SHA-256 校验文件。
+最新版本：[1.8.1](https://github.com/reF0o0/codex-model-switcher/releases/tag/v1.8.1)。各版本均提供原始安装包与 SHA-256 校验文件。
 
+- [1.8.1](https://github.com/reF0o0/codex-model-switcher/releases/tag/v1.8.1)
 - [1.8.0](https://github.com/reF0o0/codex-model-switcher/releases/tag/v1.8.0)
 - [1.7.1](https://github.com/reF0o0/codex-model-switcher/releases/tag/v1.7.1)
 - [1.7.0](https://github.com/reF0o0/codex-model-switcher/releases/tag/v1.7.0)
